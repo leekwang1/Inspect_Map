@@ -1,0 +1,9 @@
+/test/*
+/build/
+/build-*/
+/.vs/
+*.user
+*.suo
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
