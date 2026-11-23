@@ -10,6 +10,7 @@ struct SourceImage {
     QString poseJson;
     int width = 0;
     int height = 0;
+    qint64 captureTime = 0;
 };
 
 struct SourceCloud {
@@ -34,6 +35,8 @@ struct ImportedImage {
     int height = 0;
     bool hasPose = false;
     QString poseJson;
+    QString displayName;
+    qint64 captureTime = 0;
 };
 
 struct ImportedDataset {
@@ -62,4 +65,6 @@ public:
     static bool registerCorrections(const QString &projectDb, const QString &datasetId,
                                     const QString &profilePath, int *registered, QString *error);
     static bool ensureSchema(const QString &projectDb, QString *error);
+    static bool restoreReadableNames(const QString &projectDb, const QString &datasetId, int *restored, QString *error);
+    static QString correctedRelativePath(const QString &datasetId, const QString &profileHash, const ImportedImage &image);
 };

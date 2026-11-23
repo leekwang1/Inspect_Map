@@ -53,12 +53,31 @@ QString ProjectStore::databasePath(const QString &directory) {
 }
 
 bool ProjectStore::create(const QString &directory, const QString &name, QString *error) {
+    return create(directory, name, ProjectSetup{}, error);
+}
+
+bool ProjectStore::create(const QString &directory, const QString &name, const ProjectSetup &setup, QString *error) {
     if (directory.trimmed().isEmpty()) {
         if (error) *error = QStringLiteral("Project directory is required.");
         return false;
     }
     if (name.trimmed().isEmpty()) {
         if (error) *error = QStringLiteral("Project name is required.");
+        return false;
+    }
+    if ((!setup.inspectionName.isEmpty() || !setup.modelRoot.isEmpty() || !setup.cloudPath.isEmpty()) &&
+        setup.facilityName.trimmed().isEmpty()) {
+        if (error) *error = QStringLiteral("Facility name is required for quick setup.");
+        return false;
+    }
+    if (!setup.cloudPath.isEmpty() && setup.inspectionName.trimmed().isEmpty()) {
+        if (error) *error = QStringLiteral("Inspection name is required for a LAS input.");
+        return false;
+    }
+    if ((!setup.modelRoot.isEmpty() && !QFileInfo(setup.modelRoot).isDir()) ||
+        (!setup.cloudPath.isEmpty() && (!QFileInfo(setup.cloudPath).isFile() ||
+           QFileInfo(setup.cloudPath).suffix().compare(QStringLiteral("las"), Qt::CaseInsensitive) != 0))) {
+        if (error) *error = QStringLiteral("Model directory or LAS file is invalid.");
         return false;
     }
     if (!QSqlDatabase::isDriverAvailable(QStringLiteral("QSQLITE"))) {
@@ -83,6 +102,8 @@ bool ProjectStore::create(const QString &directory, const QString &name, QString
                 QStringLiteral("CREATE TABLE project (project_id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', default_length_unit TEXT NOT NULL DEFAULT 'm', status TEXT NOT NULL DEFAULT 'DRAFT', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"),
                 QStringLiteral("CREATE TABLE facility (facility_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES project(project_id), name TEXT NOT NULL, facility_type TEXT NOT NULL DEFAULT '', address TEXT NOT NULL DEFAULT '', management_code TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '')"),
                 QStringLiteral("CREATE TABLE inspection (inspection_id TEXT PRIMARY KEY, facility_id TEXT NOT NULL REFERENCES facility(facility_id), name TEXT NOT NULL, inspection_type TEXT NOT NULL DEFAULT '', started_at TEXT, ended_at TEXT, organization TEXT NOT NULL DEFAULT '', inspector TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'DRAFT')"),
+                QStringLiteral("CREATE TABLE facility_input (facility_id TEXT PRIMARY KEY REFERENCES facility(facility_id), model_root TEXT NOT NULL)"),
+                QStringLiteral("CREATE TABLE inspection_input (inspection_id TEXT PRIMARY KEY REFERENCES inspection(inspection_id), cloud_path TEXT NOT NULL)"),
                 QStringLiteral("CREATE TABLE pipeline_setting (module_id TEXT PRIMARY KEY, execution_mode TEXT NOT NULL CHECK(execution_mode IN ('AUTO','REVIEW','MANUAL','SKIP')))"),
                 QStringLiteral("CREATE TABLE module_run (run_id TEXT PRIMARY KEY, inspection_id TEXT REFERENCES inspection(inspection_id), module_id TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, error_message TEXT NOT NULL DEFAULT '')"),
                 QStringLiteral("CREATE INDEX module_run_scope ON module_run(inspection_id,module_id,started_at)"),
@@ -106,10 +127,42 @@ bool ProjectStore::create(const QString &directory, const QString &name, QString
             }
             if (ok) {
                 QSqlQuery query(db);
-                query.prepare(QStringLiteral("INSERT INTO schema_version VALUES(3,?,?,?)"));
+                const QString facilityId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+                const QString inspectionId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+                if (!setup.facilityName.trimmed().isEmpty()) {
+                    query.prepare(QStringLiteral("INSERT INTO facility(facility_id,project_id,name) "
+                        "SELECT ?,project_id,? FROM project LIMIT 1"));
+                    query.addBindValue(facilityId);
+                    query.addBindValue(setup.facilityName.trimmed());
+                    ok = query.exec();
+                }
+                if (ok && !setup.inspectionName.trimmed().isEmpty()) {
+                    query.prepare(QStringLiteral("INSERT INTO inspection(inspection_id,facility_id,name) VALUES(?,?,?)"));
+                    query.addBindValue(inspectionId);
+                    query.addBindValue(facilityId);
+                    query.addBindValue(setup.inspectionName.trimmed());
+                    ok = query.exec();
+                }
+                if (ok && !setup.modelRoot.isEmpty()) {
+                    query.prepare(QStringLiteral("INSERT INTO facility_input VALUES(?,?)"));
+                    query.addBindValue(facilityId);
+                    query.addBindValue(QFileInfo(setup.modelRoot).canonicalFilePath());
+                    ok = query.exec();
+                }
+                if (ok && !setup.cloudPath.isEmpty()) {
+                    query.prepare(QStringLiteral("INSERT INTO inspection_input VALUES(?,?)"));
+                    query.addBindValue(inspectionId);
+                    query.addBindValue(QFileInfo(setup.cloudPath).canonicalFilePath());
+                    ok = query.exec();
+                }
+                if (!ok) { if (error) *error = query.lastError().text(); }
+            }
+            if (ok) {
+                QSqlQuery query(db);
+                query.prepare(QStringLiteral("INSERT INTO schema_version VALUES(4,?,?,?)"));
                 query.addBindValue(now);
                 query.addBindValue(QStringLiteral("0.1.0"));
-                query.addBindValue(QStringLiteral("bootstrap-v3"));
+                query.addBindValue(QStringLiteral("bootstrap-v4"));
                 ok = query.exec();
                 if (!ok && error) *error = query.lastError().text();
             }
@@ -185,11 +238,82 @@ bool ProjectStore::inspections(const QString &path, const QString &facilityId, Q
     });
 }
 
+bool ProjectStore::facilityModelPath(const QString &path, const QString &facilityId, QString *modelRoot, QString *error) {
+    if (!modelRoot) return false;
+    modelRoot->clear();
+    return withDatabase(path, true, error, [&](QSqlDatabase &db) {
+        QSqlQuery query(db);
+        query.prepare(QStringLiteral("SELECT model_root FROM facility_input WHERE facility_id=?"));
+        query.addBindValue(facilityId);
+        if (!query.exec()) { if (error) *error = query.lastError().text(); return false; }
+        if (query.next()) *modelRoot = query.value(0).toString();
+        return true;
+    });
+}
+
+bool ProjectStore::inspectionCloudPath(const QString &path, const QString &inspectionId, QString *cloudPath, QString *error) {
+    if (!cloudPath) return false;
+    cloudPath->clear();
+    return withDatabase(path, true, error, [&](QSqlDatabase &db) {
+        QSqlQuery query(db);
+        query.prepare(QStringLiteral("SELECT cloud_path FROM inspection_input WHERE inspection_id=?"));
+        query.addBindValue(inspectionId);
+        if (!query.exec()) { if (error) *error = query.lastError().text(); return false; }
+        if (query.next()) *cloudPath = query.value(0).toString();
+        return true;
+    });
+}
+
+bool ProjectStore::setFacilityModelPath(const QString &path, const QString &facilityId, const QString &modelRoot, QString *error) {
+    if (facilityId.isEmpty() || (!modelRoot.isEmpty() && !QFileInfo(modelRoot).isDir())) {
+        if (error) *error = QStringLiteral("Model directory is invalid.");
+        return false;
+    }
+    return withDatabase(path, false, error, [&](QSqlDatabase &db) {
+        QSqlQuery query(db);
+        if (modelRoot.isEmpty()) {
+            query.prepare(QStringLiteral("DELETE FROM facility_input WHERE facility_id=?"));
+            query.addBindValue(facilityId);
+        } else {
+            query.prepare(QStringLiteral("INSERT INTO facility_input VALUES(?,?) ON CONFLICT(facility_id) "
+                "DO UPDATE SET model_root=excluded.model_root"));
+            query.addBindValue(facilityId);
+            query.addBindValue(QFileInfo(modelRoot).canonicalFilePath());
+        }
+        if (query.exec()) return true;
+        if (error) *error = query.lastError().text();
+        return false;
+    });
+}
+
+bool ProjectStore::setInspectionCloudPath(const QString &path, const QString &inspectionId, const QString &cloudPath, QString *error) {
+    if (inspectionId.isEmpty() || (!cloudPath.isEmpty() &&
+        (!QFileInfo(cloudPath).isFile() || QFileInfo(cloudPath).suffix().compare(QStringLiteral("las"), Qt::CaseInsensitive) != 0))) {
+        if (error) *error = QStringLiteral("LAS file is invalid.");
+        return false;
+    }
+    return withDatabase(path, false, error, [&](QSqlDatabase &db) {
+        QSqlQuery query(db);
+        if (cloudPath.isEmpty()) {
+            query.prepare(QStringLiteral("DELETE FROM inspection_input WHERE inspection_id=?"));
+            query.addBindValue(inspectionId);
+        } else {
+            query.prepare(QStringLiteral("INSERT INTO inspection_input VALUES(?,?) ON CONFLICT(inspection_id) "
+                "DO UPDATE SET cloud_path=excluded.cloud_path"));
+            query.addBindValue(inspectionId);
+            query.addBindValue(QFileInfo(cloudPath).canonicalFilePath());
+        }
+        if (query.exec()) return true;
+        if (error) *error = query.lastError().text();
+        return false;
+    });
+}
+
 bool ProjectStore::addFacility(const QString &path, const QString &name, const QString &type, QString *error) {
     return addFacility(path, FacilityInfo{{}, name, type, {}, {}, {}}, error);
 }
 
-bool ProjectStore::addFacility(const QString &path, const FacilityInfo &facility, QString *error) {
+bool ProjectStore::addFacility(const QString &path, const FacilityInfo &facility, QString *error, QString *createdId) {
     if (facility.name.trimmed().isEmpty()) {
         if (error) *error = QStringLiteral("Facility name is required.");
         return false;
@@ -201,15 +325,16 @@ bool ProjectStore::addFacility(const QString &path, const FacilityInfo &facility
             return false;
         }
         QSqlQuery query(db);
+        const QString newId = QUuid::createUuid().toString(QUuid::WithoutBraces);
         query.prepare(QStringLiteral("INSERT INTO facility(facility_id,project_id,name,facility_type,address,management_code,description) VALUES(?,?,?,?,?,?,?)"));
-        query.addBindValue(QUuid::createUuid().toString(QUuid::WithoutBraces));
+        query.addBindValue(newId);
         query.addBindValue(project.value(0));
         query.addBindValue(facility.name.trimmed());
         query.addBindValue(requiredText(facility.type.trimmed()));
         query.addBindValue(requiredText(facility.address.trimmed()));
         query.addBindValue(requiredText(facility.managementCode.trimmed()));
         query.addBindValue(requiredText(facility.description.trimmed()));
-        if (query.exec()) return true;
+        if (query.exec()) { if (createdId) *createdId = newId; return true; }
         if (error) *error = query.lastError().text();
         return false;
     });
@@ -219,7 +344,7 @@ bool ProjectStore::addInspection(const QString &path, const QString &facilityId,
     return addInspection(path, InspectionInfo{{}, facilityId, name, type, {}, {}, {}, {}, {}}, error);
 }
 
-bool ProjectStore::addInspection(const QString &path, const InspectionInfo &inspection, QString *error) {
+bool ProjectStore::addInspection(const QString &path, const InspectionInfo &inspection, QString *error, QString *createdId) {
     if (inspection.facilityId.isEmpty() || inspection.name.trimmed().isEmpty() ||
         (!inspection.startedAt.isEmpty() && !QDate::fromString(inspection.startedAt, Qt::ISODate).isValid()) ||
         (!inspection.endedAt.isEmpty() && !QDate::fromString(inspection.endedAt, Qt::ISODate).isValid()) ||
@@ -229,8 +354,9 @@ bool ProjectStore::addInspection(const QString &path, const InspectionInfo &insp
     }
     return withDatabase(path, false, error, [&](QSqlDatabase &db) {
         QSqlQuery query(db);
+        const QString newId = QUuid::createUuid().toString(QUuid::WithoutBraces);
         query.prepare(QStringLiteral("INSERT INTO inspection(inspection_id,facility_id,name,inspection_type,started_at,ended_at,organization,inspector) VALUES(?,?,?,?,?,?,?,?)"));
-        query.addBindValue(QUuid::createUuid().toString(QUuid::WithoutBraces));
+        query.addBindValue(newId);
         query.addBindValue(inspection.facilityId);
         query.addBindValue(inspection.name.trimmed());
         query.addBindValue(requiredText(inspection.type.trimmed()));
@@ -238,7 +364,7 @@ bool ProjectStore::addInspection(const QString &path, const InspectionInfo &insp
         query.addBindValue(inspection.endedAt.isEmpty() ? QVariant() : QVariant(inspection.endedAt));
         query.addBindValue(requiredText(inspection.organization.trimmed()));
         query.addBindValue(requiredText(inspection.inspector.trimmed()));
-        if (query.exec()) return true;
+        if (query.exec()) { if (createdId) *createdId = newId; return true; }
         if (error) *error = query.lastError().text();
         return false;
     });
@@ -343,8 +469,8 @@ bool ProjectStore::ensureManagerSchema(const QString &path, QString *error) {
         if (error) *error = QStringLiteral("Project database is newer than this application.");
         return false;
     }
-    if (version >= 3) return true;
-    if (version != 1 && version != 2) {
+    if (version >= 4) return true;
+    if (version != 1 && version != 2 && version != 3) {
         if (error) *error = QStringLiteral("Unsupported project database version.");
         return false;
     }
@@ -356,11 +482,14 @@ bool ProjectStore::ensureManagerSchema(const QString &path, QString *error) {
         QSqlQuery query(db);
         const QStringList statements = version == 1 ? QStringList{
             QStringLiteral("CREATE TABLE pipeline_setting (module_id TEXT PRIMARY KEY, execution_mode TEXT NOT NULL CHECK(execution_mode IN ('AUTO','REVIEW','MANUAL','SKIP')))")
-        } : QStringList{
+        } : version == 2 ? QStringList{
             QStringLiteral("CREATE TABLE module_run (run_id TEXT PRIMARY KEY, inspection_id TEXT REFERENCES inspection(inspection_id), module_id TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, error_message TEXT NOT NULL DEFAULT '')"),
             QStringLiteral("CREATE INDEX module_run_scope ON module_run(inspection_id,module_id,started_at)"),
             QStringLiteral("CREATE TABLE artifact (artifact_id TEXT PRIMARY KEY, created_by_run_id TEXT NOT NULL REFERENCES module_run(run_id), artifact_type TEXT NOT NULL, storage_path TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 0 CHECK(is_active IN (0,1)))"),
             QStringLiteral("CREATE TABLE artifact_dependency (parent_artifact_id TEXT NOT NULL REFERENCES artifact(artifact_id), child_artifact_id TEXT NOT NULL REFERENCES artifact(artifact_id), PRIMARY KEY(parent_artifact_id,child_artifact_id))")
+        } : QStringList{
+            QStringLiteral("CREATE TABLE facility_input (facility_id TEXT PRIMARY KEY REFERENCES facility(facility_id), model_root TEXT NOT NULL)"),
+            QStringLiteral("CREATE TABLE inspection_input (inspection_id TEXT PRIMARY KEY REFERENCES inspection(inspection_id), cloud_path TEXT NOT NULL)")
         };
         bool ok = true;
         for (const auto &sql : statements) if (!query.exec(sql)) { ok = false; break; }

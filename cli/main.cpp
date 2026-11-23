@@ -150,6 +150,8 @@ int main(int argc, char *argv[]) {
             !ConversionCore::images(db, firstId, &imported, &error) ||
             datasets.size() != 1 || datasets[0].poseCount != 1 || datasets[0].cloudCount != 1 ||
             imported.size() != 1 || !imported[0].hasPose ||
+            imported[0].displayName != QStringLiteral("image.jpg") ||
+            QFileInfo(imported[0].rawPath).fileName() != QStringLiteral("image.jpg") ||
             !QFileInfo(QDir(project).filePath(imported[0].rawPath)).isFile() ||
             !ProjectStore::ensureManagerSchema(db, &error)) {
             err << "converter import failed: " << error << Qt::endl;
@@ -182,7 +184,7 @@ int main(int argc, char *argv[]) {
         CorrectionResult correction;
         if (!ImageCorrection::run(db, firstId, profilePath, &correction, {}, &error) ||
             correction.processed != 1 || correction.failed != 0 ||
-            !QFileInfo(QDir(correctedDir).filePath(imported[0].id + QStringLiteral(".jpg"))).isFile()) {
+            !QFileInfo(QDir(project).filePath(ConversionCore::correctedRelativePath(firstId, hash, imported[0]))).isFile()) {
             err << "converter correction failed: " << error << " " << correction.errors.join(" | ") << Qt::endl;
             return 1;
         }
@@ -191,6 +193,40 @@ int main(int argc, char *argv[]) {
             registered != 1 || !ConversionCore::images(db, firstId, &imported, &error) ||
             imported[0].correctedPath.isEmpty()) {
             err << "converter correction registration failed: " << error << Qt::endl;
+            return 1;
+        }
+        const QString oldRaw = QStringLiteral("source/images/") + firstId + QStringLiteral("/") + imported[0].id + QStringLiteral(".jpg");
+        const QString oldCorrected = QStringLiteral("derived/images/device_undistorted/") + firstId +
+            QStringLiteral("/") + hash + QStringLiteral("/") + imported[0].id + QStringLiteral(".jpg");
+        if (!QFile::rename(QDir(project).filePath(imported[0].rawPath), QDir(project).filePath(oldRaw)) ||
+            !QFile::rename(QDir(project).filePath(imported[0].correctedPath), QDir(project).filePath(oldCorrected))) return 1;
+        {
+            auto database = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("legacy-image-test"));
+            database.setDatabaseName(db);
+            if (!database.open()) return 1;
+            QSqlQuery query(database);
+            query.prepare(QStringLiteral("UPDATE image SET raw_path=?,display_name=NULL,capture_time=NULL WHERE image_id=?"));
+            query.addBindValue(oldRaw); query.addBindValue(imported[0].id);
+            if (!query.exec()) return 1;
+            query.prepare(QStringLiteral("UPDATE image_variant SET storage_path=? WHERE image_id=? AND variant_type='RAW'"));
+            query.addBindValue(oldRaw); query.addBindValue(imported[0].id);
+            if (!query.exec()) return 1;
+            query.prepare(QStringLiteral("UPDATE image_variant SET storage_path=? WHERE image_id=? AND variant_type='DEVICE_UNDISTORTED'"));
+            query.addBindValue(oldCorrected); query.addBindValue(imported[0].id);
+            if (!query.exec()) return 1;
+            database.close();
+        }
+        QSqlDatabase::removeDatabase(QStringLiteral("legacy-image-test"));
+        int restoredCount = 0;
+        if (!ConversionCore::restoreReadableNames(db, firstId, &restoredCount, &error) || restoredCount != 1 ||
+            !ConversionCore::images(db, firstId, &imported, &error) ||
+            imported[0].displayName != QStringLiteral("image.jpg") ||
+            QFileInfo(imported[0].rawPath).fileName() != QStringLiteral("image.jpg") ||
+            QFileInfo(imported[0].correctedPath).fileName() != QStringLiteral("image.jpg") ||
+            !QFileInfo::exists(QDir(project).filePath(imported[0].rawPath)) ||
+            !QFileInfo::exists(QDir(project).filePath(imported[0].correctedPath)) ||
+            !QFileInfo::exists(QDir(project).filePath(oldRaw))) {
+            err << "legacy image name restoration failed: " << error << Qt::endl;
             return 1;
         }
         QString activeProfile;
@@ -214,6 +250,33 @@ int main(int argc, char *argv[]) {
         return 0;
     }
     if (args.size() == 2 && args[1] == QStringLiteral("self-test")) {
+        QTemporaryDir quick;
+        const QString quickModel = quick.filePath(QStringLiteral("model"));
+        const QString quickLas = quick.filePath(QStringLiteral("survey.las"));
+        QFile quickCloud(quickLas);
+        QString quickModelRead, quickCloudRead;
+        QList<FacilityInfo> quickFacilities;
+        QList<InspectionInfo> quickInspections;
+        if (!quick.isValid() || !QDir().mkpath(quickModel) || !quickCloud.open(QIODevice::WriteOnly)) return 1;
+        quickCloud.close();
+        const QString quickProjectFolder = quick.filePath(QStringLiteral("project"));
+        if (!QDir().mkpath(quickProjectFolder)
+            || !ProjectStore::create(quickProjectFolder, QStringLiteral("Quick"),
+                ProjectSetup{QStringLiteral("Bridge"), QStringLiteral("Visit"), quickModel, quickLas}, &error)
+            || !ProjectStore::facilities(ProjectStore::databasePath(quickProjectFolder), &quickFacilities, &error)
+            || quickFacilities.size() != 1
+            || !ProjectStore::inspections(ProjectStore::databasePath(quickProjectFolder), quickFacilities[0].id, &quickInspections, &error)
+            || quickInspections.size() != 1
+            || !ProjectStore::facilityModelPath(ProjectStore::databasePath(quickProjectFolder), quickFacilities[0].id, &quickModelRead, &error)
+            || !ProjectStore::inspectionCloudPath(ProjectStore::databasePath(quickProjectFolder), quickInspections[0].id, &quickCloudRead, &error)
+            || quickModelRead != QFileInfo(quickModel).canonicalFilePath()
+            || quickCloudRead != QFileInfo(quickLas).canonicalFilePath()
+            || !ProjectStore::setInspectionCloudPath(ProjectStore::databasePath(quickProjectFolder), quickInspections[0].id, {}, &error)
+            || !ProjectStore::inspectionCloudPath(ProjectStore::databasePath(quickProjectFolder), quickInspections[0].id, &quickCloudRead, &error)
+            || !quickCloudRead.isEmpty()) {
+            err << "quick setup failed: " << error << Qt::endl;
+            return 1;
+        }
         QTemporaryDir temp;
         ProjectInfo info;
         QList<FacilityInfo> facilities;
@@ -344,6 +407,8 @@ int main(int argc, char *argv[]) {
             if (!db.open()) return 1;
             QSqlQuery query(db);
             if (!query.exec(QStringLiteral("DROP TABLE artifact_dependency"))
+                || !query.exec(QStringLiteral("DROP TABLE inspection_input"))
+                || !query.exec(QStringLiteral("DROP TABLE facility_input"))
                 || !query.exec(QStringLiteral("DROP TABLE artifact"))
                 || !query.exec(QStringLiteral("DROP TABLE module_run"))
                 || !query.exec(QStringLiteral("DROP TABLE pipeline_setting"))
@@ -355,7 +420,8 @@ int main(int argc, char *argv[]) {
         if (!ProjectStore::ensureManagerSchema(legacyPath, &error)
             || !ProjectStore::pipelineModes(legacyPath, &modes, &error)
             || QDir(legacy.path()).entryList({QStringLiteral("project-before-v2-*.sqlite")}, QDir::Files).size() != 1
-            || QDir(legacy.path()).entryList({QStringLiteral("project-before-v3-*.sqlite")}, QDir::Files).size() != 1) {
+            || QDir(legacy.path()).entryList({QStringLiteral("project-before-v3-*.sqlite")}, QDir::Files).size() != 1
+            || QDir(legacy.path()).entryList({QStringLiteral("project-before-v4-*.sqlite")}, QDir::Files).size() != 1) {
             err << "migration failed: " << error << Qt::endl;
             return 1;
         }

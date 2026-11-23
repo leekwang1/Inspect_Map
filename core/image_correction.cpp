@@ -165,7 +165,8 @@ bool ImageCorrection::run(const QString &projectDb, const QString &datasetId, co
             std::vector<uchar> jpeg;
             if (!cv::imencode(".jpg", corrected, jpeg, {cv::IMWRITE_JPEG_QUALITY, 95}))
                 throw std::runtime_error("Cannot encode JPEG");
-            const QString output = QDir(outputDir).filePath(image.id + QStringLiteral(".jpg"));
+            const QString output = project.filePath(ConversionCore::correctedRelativePath(datasetId, hash, image));
+            if (!QDir().mkpath(QFileInfo(output).absolutePath())) throw std::runtime_error("Cannot create image output folder");
             QSaveFile target(output);
             if (!target.open(QIODevice::WriteOnly)) throw std::runtime_error("Cannot open output");
             if (jpeg.size() < 2 || jpeg[0] != 0xff || jpeg[1] != 0xd8) throw std::runtime_error("Invalid JPEG output");

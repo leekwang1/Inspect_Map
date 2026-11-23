@@ -179,6 +179,12 @@ private:
         projectPath_->setWordWrap(true);
         projectPath_->setTextInteractionFlags(Qt::TextSelectableByMouse);
         detailLayout->addWidget(projectPath_);
+        detailLayout->addWidget(heading(QStringLiteral("등록 입력")));
+        inputDetail_ = new QLabel;
+        inputDetail_->setObjectName(QStringLiteral("muted"));
+        inputDetail_->setWordWrap(true);
+        inputDetail_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        detailLayout->addWidget(inputDetail_);
         detailLayout->addWidget(heading(QStringLiteral("선택 작업")));
         selectionDetail_ = new QLabel(QStringLiteral("작업을 선택하세요."));
         selectionDetail_->setWordWrap(true);
@@ -443,6 +449,27 @@ private:
         pathLayout->addWidget(browse);
         form->addRow(QStringLiteral("프로젝트명"), name);
         form->addRow(QStringLiteral("빈 프로젝트 폴더"), pathRow);
+        auto *facilityName = new QLineEdit;
+        auto *inspectionName = new QLineEdit;
+        auto *model = new QLineEdit;
+        auto *cloud = new QLineEdit;
+        auto *browseModel = new QPushButton(QStringLiteral("찾아보기"));
+        auto *browseCloud = new QPushButton(QStringLiteral("찾아보기"));
+        auto *modelRow = new QWidget;
+        auto *modelLayout = new QHBoxLayout(modelRow);
+        modelLayout->setContentsMargins(0, 0, 0, 0);
+        modelLayout->addWidget(model);
+        modelLayout->addWidget(browseModel);
+        auto *cloudRow = new QWidget;
+        auto *cloudLayout = new QHBoxLayout(cloudRow);
+        cloudLayout->setContentsMargins(0, 0, 0, 0);
+        cloudLayout->addWidget(cloud);
+        cloudLayout->addWidget(browseCloud);
+        form->addRow(new QLabel(QStringLiteral("빠른 시작 (선택)")));
+        form->addRow(QStringLiteral("시설물명"), facilityName);
+        form->addRow(QStringLiteral("점검명"), inspectionName);
+        form->addRow(QStringLiteral("3D 모델 폴더"), modelRow);
+        form->addRow(QStringLiteral("LiDAR LAS"), cloudRow);
         layout->addLayout(form);
         auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
         buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("생성"));
@@ -451,10 +478,20 @@ private:
             const auto selected = QFileDialog::getExistingDirectory(&dialog, QStringLiteral("빈 프로젝트 폴더 선택"));
             if (!selected.isEmpty()) path->setText(selected);
         });
+        connect(browseModel, &QPushButton::clicked, &dialog, [&] {
+            const auto selected = QFileDialog::getExistingDirectory(&dialog, QStringLiteral("3D 모델 폴더 선택"));
+            if (!selected.isEmpty()) model->setText(selected);
+        });
+        connect(browseCloud, &QPushButton::clicked, &dialog, [&] {
+            const auto selected = QFileDialog::getOpenFileName(&dialog, QStringLiteral("LiDAR LAS 선택"), {}, QStringLiteral("LAS (*.las)"));
+            if (!selected.isEmpty()) cloud->setText(selected);
+        });
         connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
         connect(buttons, &QDialogButtonBox::accepted, &dialog, [&] {
             QString error;
-            if (!ProjectStore::create(path->text().trimmed(), name->text(), &error)) {
+            const ProjectSetup setup{facilityName->text().trimmed(), inspectionName->text().trimmed(),
+                                     model->text().trimmed(), cloud->text().trimmed()};
+            if (!ProjectStore::create(path->text().trimmed(), name->text(), setup, &error)) {
                 QMessageBox::warning(&dialog, QStringLiteral("프로젝트 생성 실패"), error);
                 return;
             }
@@ -467,7 +504,7 @@ private:
     void openProject(const QString &path) {
         ProjectInfo info;
         QString error;
-        if (!ProjectStore::read(path, &info, &error)) {
+        if (!ProjectStore::ensureManagerSchema(path, &error) || !ProjectStore::read(path, &info, &error)) {
             QMessageBox::warning(this, QStringLiteral("프로젝트 열기 실패"), error);
             refreshRecent();
             return;
@@ -648,6 +685,14 @@ private:
         for (const auto &inspection : inspections_)
             if (inspection.id == selectedInspectionId_) text += QStringLiteral(" / ") + inspection.name;
         scope_->setText(text);
+        QString model, cloud, error;
+        if (!selectedFacilityId_.isEmpty())
+            ProjectStore::facilityModelPath(projectDb_, selectedFacilityId_, &model, &error);
+        if (!selectedInspectionId_.isEmpty())
+            ProjectStore::inspectionCloudPath(projectDb_, selectedInspectionId_, &cloud, &error);
+        inputDetail_->setText(QStringLiteral("모델: %1\nLAS: %2")
+            .arg(model.isEmpty() ? QStringLiteral("미등록") : model,
+                 cloud.isEmpty() ? QStringLiteral("미등록") : cloud));
     }
 
     void refreshTree() {
@@ -681,12 +726,26 @@ private:
         auto *address = new QLineEdit(before.address);
         auto *code = new QLineEdit(before.managementCode);
         auto *description = new QLineEdit(before.description);
+        QString currentModel, error;
+        if (!create) ProjectStore::facilityModelPath(projectDb_, before.id, &currentModel, &error);
+        auto *model = new QLineEdit(currentModel);
+        auto *modelBrowse = new QPushButton(QStringLiteral("찾아보기"));
+        auto *modelRow = new QWidget;
+        auto *modelLayout = new QHBoxLayout(modelRow);
+        modelLayout->setContentsMargins(0, 0, 0, 0);
+        modelLayout->addWidget(model);
+        modelLayout->addWidget(modelBrowse);
         form->addRow(QStringLiteral("시설물명"), name);
         form->addRow(QStringLiteral("종류"), type);
         form->addRow(QStringLiteral("주소"), address);
         form->addRow(QStringLiteral("관리번호"), code);
         form->addRow(QStringLiteral("설명"), description);
+        form->addRow(QStringLiteral("3D 모델 폴더 (선택)"), modelRow);
         layout->addLayout(form);
+        connect(modelBrowse, &QPushButton::clicked, &dialog, [&] {
+            const auto selected = QFileDialog::getExistingDirectory(&dialog, QStringLiteral("3D 모델 폴더 선택"), model->text());
+            if (!selected.isEmpty()) model->setText(selected);
+        });
         auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel);
         layout->addWidget(buttons);
         connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
@@ -694,10 +753,16 @@ private:
             FacilityInfo after = before;
             after.name = name->text(); after.type = type->text(); after.address = address->text();
             after.managementCode = code->text(); after.description = description->text();
-            QString error;
-            const bool ok = create ? ProjectStore::addFacility(projectDb_, after, &error)
+            QString error, createdId;
+            if (!model->text().trimmed().isEmpty() && !QFileInfo(model->text().trimmed()).isDir()) {
+                QMessageBox::warning(&dialog, QStringLiteral("모델 경로 오류"), QStringLiteral("존재하는 모델 폴더를 선택하십시오.")); return;
+            }
+            const bool ok = create ? ProjectStore::addFacility(projectDb_, after, &error, &createdId)
                                    : ProjectStore::updateFacility(projectDb_, before, after, &error);
             if (!ok) { QMessageBox::warning(&dialog, QStringLiteral("저장 실패"), error); return; }
+            if (!ProjectStore::setFacilityModelPath(projectDb_, create ? createdId : before.id, model->text().trimmed(), &error)) {
+                QMessageBox::warning(&dialog, QStringLiteral("모델 경로 저장 실패"), error); return;
+            }
             dialog.accept();
             refreshFacilities();
         });
@@ -719,6 +784,15 @@ private:
         auto *end = new QLineEdit(before.endedAt);
         auto *organization = new QLineEdit(before.organization);
         auto *inspector = new QLineEdit(before.inspector);
+        QString currentCloud, error;
+        if (!create) ProjectStore::inspectionCloudPath(projectDb_, before.id, &currentCloud, &error);
+        auto *cloud = new QLineEdit(currentCloud);
+        auto *cloudBrowse = new QPushButton(QStringLiteral("찾아보기"));
+        auto *cloudRow = new QWidget;
+        auto *cloudLayout = new QHBoxLayout(cloudRow);
+        cloudLayout->setContentsMargins(0, 0, 0, 0);
+        cloudLayout->addWidget(cloud);
+        cloudLayout->addWidget(cloudBrowse);
         start->setPlaceholderText(QStringLiteral("YYYY-MM-DD"));
         end->setPlaceholderText(QStringLiteral("YYYY-MM-DD"));
         form->addRow(QStringLiteral("점검명"), name);
@@ -727,7 +801,12 @@ private:
         form->addRow(QStringLiteral("종료일"), end);
         form->addRow(QStringLiteral("수행기관"), organization);
         form->addRow(QStringLiteral("점검자"), inspector);
+        form->addRow(QStringLiteral("LiDAR LAS (선택)"), cloudRow);
         layout->addLayout(form);
+        connect(cloudBrowse, &QPushButton::clicked, &dialog, [&] {
+            const auto selected = QFileDialog::getOpenFileName(&dialog, QStringLiteral("LiDAR LAS 선택"), cloud->text(), QStringLiteral("LAS (*.las)"));
+            if (!selected.isEmpty()) cloud->setText(selected);
+        });
         auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel);
         layout->addWidget(buttons);
         connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
@@ -737,10 +816,17 @@ private:
             after.name = name->text(); after.type = type->text();
             after.startedAt = start->text().trimmed(); after.endedAt = end->text().trimmed();
             after.organization = organization->text(); after.inspector = inspector->text();
-            QString error;
-            const bool ok = create ? ProjectStore::addInspection(projectDb_, after, &error)
+            QString error, createdId;
+            const QFileInfo cloudFile(cloud->text().trimmed());
+            if (!cloud->text().trimmed().isEmpty() && (!cloudFile.isFile() || cloudFile.suffix().compare(QStringLiteral("las"), Qt::CaseInsensitive))) {
+                QMessageBox::warning(&dialog, QStringLiteral("LAS 경로 오류"), QStringLiteral("존재하는 LAS 파일을 선택하십시오.")); return;
+            }
+            const bool ok = create ? ProjectStore::addInspection(projectDb_, after, &error, &createdId)
                                    : ProjectStore::updateInspection(projectDb_, before, after, &error);
             if (!ok) { QMessageBox::warning(&dialog, QStringLiteral("저장 실패"), error); return; }
+            if (!ProjectStore::setInspectionCloudPath(projectDb_, create ? createdId : before.id, cloud->text().trimmed(), &error)) {
+                QMessageBox::warning(&dialog, QStringLiteral("LAS 경로 저장 실패"), error); return;
+            }
             dialog.accept();
             selectFacility(facilityTable_->currentRow());
         });
@@ -756,6 +842,7 @@ private:
     QLabel *projectName_ = nullptr;
     QLabel *projectId_ = nullptr;
     QLabel *projectPath_ = nullptr;
+    QLabel *inputDetail_ = nullptr;
     QTreeWidget *tree_ = nullptr;
     QTabWidget *tabs_ = nullptr;
     QTableWidget *recent_ = nullptr;

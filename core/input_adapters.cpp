@@ -2,12 +2,14 @@
 
 #include <QDir>
 #include <QDirIterator>
+#include <QCollator>
 #include <QFile>
 #include <QFileInfo>
 #include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <algorithm>
 
 namespace {
 bool imageSize(const QString &path, int *width, int *height) {
@@ -68,6 +70,8 @@ public:
             image.sourceId = snapshot.value(QStringLiteral("id")).toString();
             image.sourcePath = imagePath;
             image.flightId = snapshot.value(QStringLiteral("flight_id")).toString();
+            image.captureTime = snapshot.value(QStringLiteral("audit")).toObject()
+                .value(QStringLiteral("created_date")).toVariant().toLongLong();
             image.poseJson = QString::fromUtf8(QJsonDocument(snapshot.value(QStringLiteral("camera_pose")).toObject()).toJson(QJsonDocument::Compact));
             if (image.sourceId.isEmpty() || imageName.isEmpty() ||
                 !insideDirectory(folder.absoluteFilePath(), imagePath) || !QFileInfo(imagePath).isFile() ||
@@ -153,6 +157,17 @@ bool InputAdapters::scan(const QString &root, const QString &requestedAdapter,
     result->adapter = selected->id();
     result->root = QDir(root).absolutePath();
     selected->collect(result->root, result);
+    QCollator collator;
+    collator.setNumericMode(true);
+    std::stable_sort(result->images.begin(), result->images.end(), [&](const SourceImage &a, const SourceImage &b) {
+        if (a.flightId != b.flightId) return a.flightId < b.flightId;
+        if (a.captureTime != b.captureTime) {
+            if (!a.captureTime) return false;
+            if (!b.captureTime) return true;
+            return a.captureTime < b.captureTime;
+        }
+        return collator.compare(QFileInfo(a.sourcePath).fileName(), QFileInfo(b.sourcePath).fileName()) < 0;
+    });
     if (result->images.isEmpty()) {
         if (error) *error = QStringLiteral("No usable images found.");
         return false;

@@ -54,7 +54,8 @@ deploy_qt_runtime(ProjectManager)
 
 add_executable(DataConverter WIN32 apps/data_converter.cpp apps/lidar_preview.cpp apps/lidar_preview.h)
 target_link_libraries(DataConverter PRIVATE InspectCore Qt6::Widgets)
-find_package(VTK REQUIRED COMPONENTS CommonCore CommonDataModel FiltersSources
+find_package(VTK REQUIRED COMPONENTS CommonCore CommonDataModel CommonTransforms
+    FiltersCore FiltersGeneral FiltersSources IOGeometry
     RenderingCore RenderingOpenGL2 InteractionStyle GUISupportQt)
 if(NOT TARGET VTK::GUISupportQt OR VTK_QT_VERSION VERSION_LESS 6)
     message(FATAL_ERROR "DataConverter requires VTK built with Qt 6 support.")
@@ -75,7 +76,35 @@ add_custom_command(TARGET DataConverter POST_BUILD COMMAND ${CMAKE_COMMAND} -E c
     $<TARGET_FILE:OpenCVWorld> $<TARGET_FILE_DIR:DataConverter>)
 deploy_qt_runtime(DataConverter)
 
+add_library(RegistrationEngine STATIC apps/registration_engine.cpp apps/registration_engine.h)
+target_link_libraries(RegistrationEngine PUBLIC Qt6::Core Qt6::Gui
+    VTK::CommonCore VTK::CommonDataModel VTK::CommonTransforms
+    VTK::FiltersCore VTK::FiltersGeneral VTK::IOGeometry)
+target_include_directories(RegistrationEngine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/apps)
+
+add_executable(RegistrationTool WIN32 apps/registration_tool.cpp apps/lidar_preview.cpp apps/lidar_preview.h)
+target_compile_definitions(RegistrationTool PRIVATE INSPECTMAP_WITH_VTK)
+target_link_libraries(RegistrationTool PRIVATE RegistrationEngine InspectCore Qt6::Widgets Qt6::Sql
+    Qt6::OpenGLWidgets VTK::RenderingCore VTK::RenderingOpenGL2
+    VTK::InteractionStyle VTK::GUISupportQt VTK::FiltersSources)
+vtk_module_autoinit(TARGETS RegistrationTool MODULES ${VTK_LIBRARIES})
+add_custom_command(TARGET RegistrationTool POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${VTK_RUNTIME_DLLS} $<TARGET_FILE_DIR:RegistrationTool> VERBATIM)
+add_custom_command(TARGET RegistrationTool POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:OpenCVWorld> $<TARGET_FILE_DIR:RegistrationTool>)
+deploy_qt_runtime(RegistrationTool)
+
+add_executable(RegistrationEngineTest cli/registration_engine_test.cpp)
+set_target_properties(RegistrationEngineTest PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests/$<CONFIG>")
+target_link_libraries(RegistrationEngineTest PRIVATE RegistrationEngine)
+add_custom_command(TARGET RegistrationEngineTest POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${VTK_RUNTIME_DLLS} $<TARGET_FILE_DIR:RegistrationEngineTest> VERBATIM)
+deploy_qt_runtime(RegistrationEngineTest)
+
 
 enable_testing()
 add_test(NAME project_store_smoke COMMAND InspectionCli self-test)
 add_test(NAME converter_smoke COMMAND InspectionCli converter-self-test)
+add_test(NAME registration_engine COMMAND RegistrationEngineTest)

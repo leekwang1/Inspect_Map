@@ -1,5 +1,6 @@
 #include "conversion_core.h"
 #include "image_correction.h"
+#include <algorithm>
 #include "lidar_preview.h"
 #include "project_store.h"
 
@@ -186,7 +187,7 @@ private:
         adapter_->addItem(QStringLiteral("Elios Inspector 5"), QStringLiteral("ELIOS_INSPECTOR5"));
         adapter_->addItem(QStringLiteral("이미지 폴더 (DJI 포함)"), QStringLiteral("IMAGE_FOLDER"));
         auto *scanButton = new QPushButton(QStringLiteral("스캔"));
-        importButton_ = new QPushButton(QStringLiteral("가져오기"));
+        importButton_ = new QPushButton(QStringLiteral("프로젝트에 등록"));
         importButton_->setObjectName(QStringLiteral("primary"));
         importButton_->setEnabled(false);
         inputBar->addWidget(sourcePath_, 1);
@@ -208,6 +209,9 @@ private:
         leftLayout->addWidget(section(QStringLiteral("데이터 세트")));
         datasets_ = new QListWidget;
         leftLayout->addWidget(datasets_, 1);
+        restoreNamesButton_ = new QPushButton(QStringLiteral("기존 파일명 복원"));
+        restoreNamesButton_->setEnabled(false);
+        leftLayout->addWidget(restoreNamesButton_);
         leftLayout->addWidget(section(QStringLiteral("이미지 보정")));
         profilePath_ = new QLineEdit;
         profilePath_->setPlaceholderText(QStringLiteral("K/D/P JSON 프로필"));
@@ -229,6 +233,19 @@ private:
         });
         connect(profilePath_, &QLineEdit::textChanged, this, [this] { updateCorrectionUi(); });
         connect(correctButton_, &QPushButton::clicked, this, [this] { correctImages(); });
+        connect(restoreNamesButton_, &QPushButton::clicked, this, [this] {
+            if (datasetId_.isEmpty() || correctionRunning_) return;
+            if (QMessageBox::question(this, QStringLiteral("기존 파일명 복원"),
+                QStringLiteral("UUID 이름으로 저장된 이미지를 원본 파일명으로 복사하고 DB 경로를 갱신합니다. 기존 UUID 파일은 남겨둡니다. 진행하시겠습니까?")) != QMessageBox::Yes) return;
+            QApplication::setOverrideCursor(Qt::WaitCursor);
+            int restored = 0;
+            QString error;
+            const bool ok = ConversionCore::restoreReadableNames(projectDb_, datasetId_, &restored, &error);
+            QApplication::restoreOverrideCursor();
+            if (!ok) { QMessageBox::warning(this, QStringLiteral("복원 실패"), error); return; }
+            selectDataset(datasets_->currentRow());
+            QMessageBox::information(this, QStringLiteral("복원 완료"), QStringLiteral("%1장의 파일명을 복원했습니다.").arg(restored));
+        });
         connect(datasets_, &QListWidget::currentRowChanged, this, [this](int row) { selectDataset(row); });
 
         tabs_ = new QTabWidget;
@@ -238,11 +255,12 @@ private:
         summary_->setWordWrap(true);
         imageLayout->addWidget(summary_);
         auto *reviewSplit = new QSplitter(Qt::Horizontal);
-        imageTable_ = new QTableWidget(0, 3);
-        imageTable_->setHorizontalHeaderLabels({QStringLiteral("영상"), QStringLiteral("pose"), QStringLiteral("보정")});
-        imageTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-        imageTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+        imageTable_ = new QTableWidget(0, 4);
+        imageTable_->setHorizontalHeaderLabels({QStringLiteral("순서"), QStringLiteral("영상"), QStringLiteral("pose"), QStringLiteral("보정")});
+        imageTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+        imageTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
         imageTable_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+        imageTable_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
         imageTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
         imageTable_->setSelectionMode(QAbstractItemView::SingleSelection);
         imageTable_->setShowGrid(false);
@@ -415,9 +433,11 @@ private:
             return;
         }
         displayed_ = {};
+        restoreNamesButton_->setEnabled(false);
         for (const auto &item : scan_.images)
             displayed_.append({{}, item.sourceId, item.sourcePath, {}, item.width, item.height,
-                               !item.poseJson.isEmpty() && item.poseJson != QStringLiteral("{}"), item.poseJson});
+                               !item.poseJson.isEmpty() && item.poseJson != QStringLiteral("{}"), item.poseJson,
+                               QFileInfo(item.sourcePath).fileName(), item.captureTime});
         fillImages(false);
         fillClouds(scan_.clouds);
         int poseCount = 0;
@@ -433,7 +453,7 @@ private:
         datasetId_.clear();
         updateCorrectionUi();
         selectImage(0);
-        status_->setText(scan_.warnings.isEmpty() ? QStringLiteral("스캔 완료 · 가져오기 전 원본은 변경되지 않았습니다.")
+        status_->setText(scan_.warnings.isEmpty() ? QStringLiteral("스캔 완료 · 프로젝트에 등록하기 전 원본은 변경되지 않았습니다.")
                                             : scan_.warnings.join(QStringLiteral(" | ")));
     }
 
@@ -441,11 +461,13 @@ private:
         if (projectDb_.isEmpty() || scan_.images.isEmpty()) return;
         QString id, error;
         if (!ConversionCore::importDataset(projectDb_, inspectionId_, scan_, &id, &error)) {
-            QMessageBox::warning(this, QStringLiteral("가져오기 실패"), error);
+            QMessageBox::warning(this, QStringLiteral("프로젝트 등록 실패"), error);
             return;
         }
         reloadDatasets(id);
-        status_->setText(QStringLiteral("가져오기 완료 · 원본 이미지가 프로젝트 source/images에 저장되었습니다."));
+        const QString message = QStringLiteral("프로젝트 등록이 완료되었습니다.\n원본 이미지는 프로젝트의 source/images에 저장되었고, LAS는 원본 경로로 연결됩니다.");
+        status_->setText(QStringLiteral("프로젝트 등록 완료"));
+        QMessageBox::information(this, QStringLiteral("등록 완료"), message);
     }
 
     void reloadDatasets(const QString &selectId = {}) {
@@ -465,6 +487,7 @@ private:
         if (selected < 0 && !datasetList_.isEmpty()) selected = 0;
         if (selected >= 0) datasets_->setCurrentRow(selected);
         else {
+            restoreNamesButton_->setEnabled(false);
             datasetId_.clear();
             displayed_.clear();
             fillImages(true);
@@ -484,6 +507,8 @@ private:
             QMessageBox::warning(this, QStringLiteral("이미지 조회 실패"), error);
             return;
         }
+        restoreNamesButton_->setEnabled(std::any_of(displayed_.cbegin(), displayed_.cend(),
+            [](const ImportedImage &image) { return image.displayName.isEmpty(); }));
         QList<SourceCloud> clouds;
         if (!ConversionCore::clouds(projectDb_, datasetId_, &clouds, &error)) {
             QMessageBox::warning(this, QStringLiteral("LiDAR 조회 실패"), error);
@@ -529,15 +554,15 @@ private:
         cameras.reserve(displayed_.size());
         for (int row = 0; row < displayed_.size(); ++row) {
             const auto &image = displayed_[row];
-            const QString name = QFileInfo(image.rawPath).fileName();
+            const QString name = image.displayName.isEmpty() ? QFileInfo(image.rawPath).fileName() : image.displayName;
             cloudImage_->addItem(name.isEmpty() ? image.sourceId : name);
             cameras.append(parsePreviewCamera(image.poseJson));
-            const QStringList values{name.isEmpty() ? image.sourceId : name,
+            const QStringList values{QString::number(row + 1), name.isEmpty() ? image.sourceId : name,
                 image.hasPose ? QStringLiteral("있음") : QStringLiteral("없음"),
                 image.correctedPath.isEmpty() ? QStringLiteral("없음") : QStringLiteral("완료")};
             for (int col = 0; col < values.size(); ++col) {
                 auto *item = new QTableWidgetItem(values[col]);
-                if (col == 0) item->setToolTip(QStringLiteral("%1\n%2×%3\n%4")
+                if (col == 1) item->setToolTip(QStringLiteral("%1\n%2×%3\n%4")
                     .arg(image.sourceId).arg(image.width).arg(image.height)
                     .arg(imported ? QStringLiteral("프로젝트 원본") : QStringLiteral("스캔 원본")));
                 imageTable_->setItem(row, col, item);
@@ -740,6 +765,7 @@ private:
     QLabel *profileStatus_ = nullptr;
     QPushButton *importButton_ = nullptr;
     QPushButton *correctButton_ = nullptr;
+    QPushButton *restoreNamesButton_ = nullptr;
     QTabWidget *tabs_ = nullptr;
     int cloudTabIndex_ = -1;
     int viewMode_ = 0;

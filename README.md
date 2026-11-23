@@ -62,3 +62,29 @@ or select `IMAGE_FOLDER` explicitly for an image-only folder.
 `InspectionCli convert-correct <project.sqlite> <dataset-id> <profile.json>`
 runs the same correction engine without the GUI. `converter_smoke` tests import,
 correction and image-variant registration.
+
+## Registration Tool (first working slice)
+
+`RegistrationTool` opens from Project Manager or independently. Load a directory
+containing `model/<part>/<part>.obj` (or select `model/` itself), then select a
+LAS cloud from the project or a file. Each OBJ's `meta.gxxml` scale, translation
+and rotation are applied before registration. When metadata is absent, choose
+the fallback model unit (mm or m) before loading. The adjacent `map/` directory
+is detected but DXF-to-face mapping is not implemented in this slice.
+
+For manual registration, select corresponding LiDAR and model points in the two
+VTK views and compute a rigid transform from at least three non-collinear pairs;
+four or more widely separated pairs are recommended. The optional similarity
+mode estimates one uniform scale for unscaled SfM reconstructions. ICP can
+refine this transform. Without a manual result, ICP starts by matching centroids
+and is only a candidate, not reliable global registration for partial or
+axis-misaligned scans. Review the surface RMSE and fraction of sampled cloud
+points within 0.5 m of the model before accepting it.
+
+Accepted transforms are versioned in the project's `registration_result` table.
+The original LAS and `INITIAL` camera poses remain unchanged. `MODEL_ALIGNED`
+camera poses are written only when the selected LAS belongs to a project dataset
+and the operator confirms the camera poses share the LAS coordinate frame.
+The current viewer reads uncompressed LAS; PLY and other SfM point-cloud formats
+are still to be added. `registration_engine` tests rigid/similarity fitting,
+camera orientation, ICP and the sample model's unit transform.
