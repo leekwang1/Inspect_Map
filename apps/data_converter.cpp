@@ -9,6 +9,7 @@
 #include <QComboBox>
 #include <QCheckBox>
 #include <QCloseEvent>
+#include <QDateTime>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QGraphicsPixmapItem>
@@ -32,6 +33,7 @@
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QTimer>
+#include <QUuid>
 #include <QVBoxLayout>
 #include <QWheelEvent>
 #include <memory>
@@ -459,11 +461,14 @@ private:
 
     void importSource() {
         if (projectDb_.isEmpty() || scan_.images.isEmpty()) return;
+        const QString runId = startConversionRun();
         QString id, error;
         if (!ConversionCore::importDataset(projectDb_, inspectionId_, scan_, &id, &error)) {
+            finishConversionRun(runId, QStringLiteral("FAILED"), error);
             QMessageBox::warning(this, QStringLiteral("프로젝트 등록 실패"), error);
             return;
         }
+        finishConversionRun(runId, QStringLiteral("VALID"), {});
         reloadDatasets(id);
         const QString message = QStringLiteral("프로젝트 등록이 완료되었습니다.\n원본 이미지는 프로젝트의 source/images에 저장되었고, LAS는 원본 경로로 연결됩니다.");
         status_->setText(QStringLiteral("프로젝트 등록 완료"));
@@ -700,13 +705,14 @@ private:
             QMessageBox::warning(this, QStringLiteral("보정 불가"), profileError);
             return;
         }
+        const QString runId = startConversionRun();
         correctionRunning_ = true;
         correctButton_->setEnabled(false);
         datasets_->setEnabled(false);
         status_->setText(QStringLiteral("이미지 보정 중 · %1장").arg(displayed_.size()));
         const QString currentDataset = datasetId_;
         const QString currentProject = projectDb_;
-        QThread *worker = QThread::create([this, currentProject, currentDataset, selectedProfile] {
+        QThread *worker = QThread::create([this, currentProject, currentDataset, selectedProfile, runId] {
             CorrectionResult result;
             QString error;
             const bool ok = ImageCorrection::run(currentProject, currentDataset, selectedProfile, &result,
@@ -718,8 +724,11 @@ private:
             int registered = 0;
             if (ok && !ConversionCore::registerCorrections(currentProject, currentDataset, selectedProfile, &registered, &error))
                 error = QStringLiteral("결과 DB 등록 실패: ") + error;
-            QMetaObject::invokeMethod(this, [this, ok, result, error, registered] {
+            QMetaObject::invokeMethod(this, [this, ok, result, error, registered, runId] {
                 correctionRunning_ = false;
+                const QString runStatus = ok && error.isEmpty() && result.failed == 0 ? QStringLiteral("VALID") :
+                    registered > 0 ? QStringLiteral("REVIEW") : QStringLiteral("FAILED");
+                finishConversionRun(runId, runStatus, error.isEmpty() ? result.errors.join(QStringLiteral(" | ")) : error);
                 datasets_->setEnabled(true);
                 selectDataset(datasets_->currentRow());
                 const QString outcome = !error.isEmpty() ? error : result.failed ?
@@ -730,6 +739,25 @@ private:
         });
         connect(worker, &QThread::finished, worker, &QObject::deleteLater);
         worker->start();
+    }
+
+    QString startConversionRun() {
+        if (projectDb_.isEmpty()) return {};
+        const QString runId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        QString error;
+        if (!ProjectStore::recordRun(projectDb_, {runId, inspectionId_, QStringLiteral("conversion"),
+            QStringLiteral("RUNNING"), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs), {}, {}}, &error)) {
+            QMessageBox::warning(this, QStringLiteral("작업 이력 저장 실패"), error);
+            return {};
+        }
+        return runId;
+    }
+
+    void finishConversionRun(const QString &runId, const QString &runStatus, const QString &message) {
+        if (runId.isEmpty()) return;
+        QString error;
+        if (!ProjectStore::finishRun(projectDb_, runId, runStatus, message, &error))
+            QMessageBox::warning(this, QStringLiteral("작업 현황 갱신 실패"), error);
     }
 
     QString projectDb_;

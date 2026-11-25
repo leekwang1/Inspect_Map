@@ -12,6 +12,8 @@ class vtkPolyData;
 struct RegistrationPart {
     QString id;
     vtkSmartPointer<vtkPolyData> geometry;
+    vtkSmartPointer<vtkPolyData> exteriorFaces;
+    vtkSmartPointer<vtkPolyData> interiorFaces;
 };
 
 struct RegistrationMetrics {
@@ -28,7 +30,7 @@ public:
     static bool landmarks(const QVector<QVector3D> &source, const QVector<QVector3D> &target,
                           bool allowScale, vtkMatrix4x4 *matrix, double *rmse, QString *error);
     static bool icp(vtkPolyData *source, vtkPolyData *target, vtkMatrix4x4 *initial,
-                    vtkMatrix4x4 *matrix, int *iterations, QString *error);
+                    bool allowScale, vtkMatrix4x4 *matrix, int *iterations, QString *error);
     static RegistrationMetrics measure(vtkPolyData *source, vtkPolyData *target,
                                        vtkMatrix4x4 *matrix, double thresholdMeters = 0.5);
     static QVector3D transformPoint(vtkMatrix4x4 *matrix, const QVector3D &point);

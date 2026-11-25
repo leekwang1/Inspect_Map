@@ -5,10 +5,19 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QMatrix3x3>
+#include <QQuaternion>
 #include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
+#include <QSqlRecord>
 #include <QUuid>
+#include <QVector3D>
+#include <array>
+#include <cmath>
 #include <functional>
 
 namespace {
@@ -593,6 +602,228 @@ bool ProjectStore::recordRun(const QString &path, const ModuleRunInfo &run, QStr
         if (query.exec()) return true;
         if (error) *error = query.lastError().text();
         return false;
+    });
+}
+
+bool ProjectStore::finishRun(const QString &path, const QString &runId, const QString &status,
+                             const QString &message, QString *error) {
+    if (runId.isEmpty() || !QStringList{QStringLiteral("VALID"), QStringLiteral("REVIEW"),
+        QStringLiteral("FAILED"), QStringLiteral("CANCELLED")}.contains(status)) {
+        if (error) *error = QStringLiteral("Invalid run completion.");
+        return false;
+    }
+    return withDatabase(path, false, error, [&](QSqlDatabase &db) {
+        QSqlQuery query(db);
+        query.prepare(QStringLiteral("UPDATE module_run SET status=?,finished_at=?,error_message=? "
+                                     "WHERE run_id=? AND status='RUNNING'"));
+        query.addBindValue(status);
+        query.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
+        query.addBindValue(message.isNull() ? QStringLiteral("") : message);
+        query.addBindValue(runId);
+        if (query.exec() && query.numRowsAffected() == 1) return true;
+        if (error) *error = query.lastError().isValid() ? query.lastError().text() :
+            QStringLiteral("Run is not in progress.");
+        return false;
+    });
+}
+
+bool ProjectStore::ensureRegistrationSchema(const QString &path, QString *error) {
+    return withDatabase(path, false, error, [&](QSqlDatabase &db) {
+        if (!db.transaction()) { if (error) *error = db.lastError().text(); return false; }
+        bool ok = execute(db, QStringLiteral("CREATE TABLE IF NOT EXISTS registration_result ("
+            "registration_id TEXT PRIMARY KEY, inspection_id TEXT, dataset_id TEXT, point_cloud_id TEXT, "
+            "source_cloud_path TEXT NOT NULL, model_root TEXT NOT NULL, method TEXT NOT NULL, "
+            "matrix_json TEXT NOT NULL, scale REAL NOT NULL, landmark_rmse REAL, surface_rmse REAL, "
+            "overlap REAL, icp_iterations INTEGER, pose_frame_confirmed INTEGER NOT NULL, "
+            "created_at TEXT NOT NULL, active INTEGER NOT NULL, survey_side TEXT NOT NULL DEFAULT '', "
+            "review_status TEXT NOT NULL DEFAULT 'CONFIRMED', confirmed_at TEXT, run_id TEXT)"), error);
+        const auto columns = db.record(QStringLiteral("registration_result"));
+        const struct { const char *name; const char *definition; } additions[] = {
+            {"survey_side", "survey_side TEXT NOT NULL DEFAULT ''"},
+            {"inspection_id", "inspection_id TEXT"},
+            {"review_status", "review_status TEXT NOT NULL DEFAULT 'CONFIRMED'"},
+            {"confirmed_at", "confirmed_at TEXT"},
+            {"run_id", "run_id TEXT"}
+        };
+        for (const auto &column : additions) {
+            if (ok && columns.indexOf(QString::fromLatin1(column.name)) < 0)
+                ok = execute(db, QStringLiteral("ALTER TABLE registration_result ADD COLUMN ") +
+                    QString::fromLatin1(column.definition), error);
+        }
+        if (ok && db.commit()) return true;
+        if (ok && error) *error = db.lastError().text();
+        db.rollback();
+        return false;
+    });
+}
+
+bool ProjectStore::pendingRegistrations(const QString &path, const QString &inspectionId,
+                                        QList<RegistrationReviewInfo> *items, QString *error) {
+    if (!items) return false;
+    items->clear();
+    return withDatabase(path, true, error, [&](QSqlDatabase &db) {
+        if (!db.tables().contains(QStringLiteral("registration_result")) ||
+            db.record(QStringLiteral("registration_result")).indexOf(QStringLiteral("review_status")) < 0)
+            return true;
+        QSqlQuery query(db);
+        query.prepare(QStringLiteral("SELECT registration_id,inspection_id,dataset_id,source_cloud_path,"
+            "model_root,method,matrix_json,survey_side,created_at,pose_frame_confirmed,"
+            "surface_rmse,overlap FROM registration_result "
+            "WHERE review_status='PENDING' AND (?='' OR inspection_id=? OR inspection_id IS NULL) "
+            "ORDER BY created_at DESC,registration_id DESC"));
+        query.addBindValue(inspectionId);
+        query.addBindValue(inspectionId);
+        if (!query.exec()) { if (error) *error = query.lastError().text(); return false; }
+        while (query.next()) items->append({query.value(0).toString(), query.value(1).toString(),
+            query.value(2).toString(), query.value(3).toString(), query.value(4).toString(),
+            query.value(5).toString(), query.value(6).toString(), query.value(7).toString(),
+            query.value(8).toString(), query.value(9).toBool(), query.value(10).toDouble(),
+            query.value(11).toDouble()});
+        return true;
+    });
+}
+
+bool ProjectStore::confirmRegistration(const QString &path, const QString &registrationId,
+                                       int *poseCount, QString *error) {
+    if (poseCount) *poseCount = 0;
+    if (registrationId.isEmpty()) {
+        if (error) *error = QStringLiteral("Registration ID is required.");
+        return false;
+    }
+    return withDatabase(path, false, error, [&](QSqlDatabase &db) {
+        if (!db.transaction()) { if (error) *error = db.lastError().text(); return false; }
+        auto fail = [&](const QString &message) {
+            if (error) *error = message;
+            db.rollback();
+            return false;
+        };
+        QSqlQuery selected(db);
+        selected.prepare(QStringLiteral("SELECT inspection_id,dataset_id,source_cloud_path,matrix_json,"
+            "pose_frame_confirmed,run_id FROM registration_result "
+            "WHERE registration_id=? AND review_status='PENDING' AND active=0"));
+        selected.addBindValue(registrationId);
+        if (!selected.exec()) return fail(selected.lastError().text());
+        if (!selected.next()) return fail(QStringLiteral("Pending registration result not found."));
+        const QString inspectionId = selected.value(0).toString();
+        const QString datasetId = selected.value(1).toString();
+        const QString cloudPath = selected.value(2).toString();
+        const auto matrixRows = QJsonDocument::fromJson(selected.value(3).toString().toUtf8()).array();
+        const bool transformPoses = selected.value(4).toBool();
+        const QString runId = selected.value(5).toString();
+        std::array<std::array<double, 4>, 4> matrix{};
+        if (matrixRows.size() != 4) return fail(QStringLiteral("Invalid registration matrix."));
+        for (int row = 0; row < 4; ++row) {
+            const auto columns = matrixRows[row].toArray();
+            if (columns.size() != 4) return fail(QStringLiteral("Invalid registration matrix."));
+            for (int column = 0; column < 4; ++column) {
+                if (!columns[column].isDouble() || !std::isfinite(columns[column].toDouble()))
+                    return fail(QStringLiteral("Invalid registration matrix."));
+                matrix[row][column] = columns[column].toDouble();
+            }
+        }
+        const double scale = std::sqrt(matrix[0][0] * matrix[0][0] +
+            matrix[1][0] * matrix[1][0] + matrix[2][0] * matrix[2][0]);
+        if (!std::isfinite(scale) || scale < 1e-12)
+            return fail(QStringLiteral("Invalid registration scale."));
+        QMatrix3x3 rotationMatrix;
+        for (int row = 0; row < 3; ++row)
+            for (int column = 0; column < 3; ++column)
+                rotationMatrix(row, column) = float(matrix[row][column] / scale);
+        const QQuaternion frameRotation = QQuaternion::fromRotationMatrix(rotationMatrix);
+
+        QSqlQuery deactivate(db);
+        deactivate.prepare(QStringLiteral("UPDATE registration_result SET active=0 "
+            "WHERE active=1 AND (source_cloud_path=? OR (?<>'' AND dataset_id=?))"));
+        deactivate.addBindValue(cloudPath);
+        deactivate.addBindValue(datasetId);
+        deactivate.addBindValue(datasetId);
+        if (!deactivate.exec()) return fail(deactivate.lastError().text());
+        int converted = 0;
+        if (!datasetId.isEmpty()) {
+            QSqlQuery clear(db);
+            clear.prepare(QStringLiteral("DELETE FROM camera_pose WHERE pose_stage='MODEL_ALIGNED' "
+                "AND image_id IN (SELECT image_id FROM image WHERE dataset_id=?)"));
+            clear.addBindValue(datasetId);
+            if (!clear.exec()) return fail(clear.lastError().text());
+        }
+        if (transformPoses) {
+            if (datasetId.isEmpty()) return fail(QStringLiteral("Camera data set is missing."));
+            QSqlQuery initial(db);
+            initial.prepare(QStringLiteral("SELECT p.image_id,p.pose_json FROM camera_pose p "
+                "JOIN image i ON i.image_id=p.image_id WHERE i.dataset_id=? AND p.pose_stage='INITIAL'"));
+            initial.addBindValue(datasetId);
+            if (!initial.exec()) return fail(initial.lastError().text());
+            while (initial.next()) {
+                QJsonObject pose = QJsonDocument::fromJson(initial.value(1).toString().toUtf8()).object();
+                const auto position = pose.value(QStringLiteral("position")).toObject();
+                const auto orientation = pose.value(QStringLiteral("orientation")).toObject();
+                if (position.isEmpty() || orientation.isEmpty())
+                    return fail(QStringLiteral("Invalid initial camera pose."));
+                const double x = position.value(QStringLiteral("x")).toDouble();
+                const double y = position.value(QStringLiteral("y")).toDouble();
+                const double z = position.value(QStringLiteral("z")).toDouble();
+                const QQuaternion original(float(orientation.value(QStringLiteral("w")).toDouble()),
+                    float(orientation.value(QStringLiteral("x")).toDouble()),
+                    float(orientation.value(QStringLiteral("y")).toDouble()),
+                    float(orientation.value(QStringLiteral("z")).toDouble()));
+                if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || original.isNull())
+                    return fail(QStringLiteral("Invalid initial camera pose."));
+                const QQuaternion turned = (frameRotation * original.normalized()).normalized();
+                pose.insert(QStringLiteral("position"), QJsonObject{
+                    {QStringLiteral("x"), matrix[0][0] * x + matrix[0][1] * y + matrix[0][2] * z + matrix[0][3]},
+                    {QStringLiteral("y"), matrix[1][0] * x + matrix[1][1] * y + matrix[1][2] * z + matrix[1][3]},
+                    {QStringLiteral("z"), matrix[2][0] * x + matrix[2][1] * y + matrix[2][2] * z + matrix[2][3]}});
+                pose.insert(QStringLiteral("orientation"), QJsonObject{
+                    {QStringLiteral("w"), turned.scalar()}, {QStringLiteral("x"), turned.x()},
+                    {QStringLiteral("y"), turned.y()}, {QStringLiteral("z"), turned.z()}});
+                pose.insert(QStringLiteral("registration_id"), registrationId);
+                QSqlQuery upsert(db);
+                upsert.prepare(QStringLiteral("INSERT INTO camera_pose VALUES(?,?,?,?,?,?) "
+                    "ON CONFLICT(image_id,pose_stage) DO UPDATE SET pose_json=excluded.pose_json, "
+                    "source_kind=excluded.source_kind,status=excluded.status"));
+                upsert.addBindValue(QUuid::createUuid().toString(QUuid::WithoutBraces));
+                upsert.addBindValue(initial.value(0));
+                upsert.addBindValue(QStringLiteral("MODEL_ALIGNED"));
+                upsert.addBindValue(QString::fromUtf8(QJsonDocument(pose).toJson(QJsonDocument::Compact)));
+                upsert.addBindValue(QStringLiteral("REGISTRATION"));
+                upsert.addBindValue(QStringLiteral("VALID"));
+                if (!upsert.exec()) return fail(upsert.lastError().text());
+                ++converted;
+            }
+            if (converted == 0) return fail(QStringLiteral("No initial camera poses to transform."));
+        }
+        const QString confirmedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+        QSqlQuery confirm(db);
+        confirm.prepare(QStringLiteral("UPDATE registration_result SET active=1,review_status='CONFIRMED',"
+            "confirmed_at=? WHERE registration_id=? AND review_status='PENDING'"));
+        confirm.addBindValue(confirmedAt);
+        confirm.addBindValue(registrationId);
+        if (!confirm.exec() || confirm.numRowsAffected() != 1)
+            return fail(confirm.lastError().isValid() ? confirm.lastError().text() :
+                QStringLiteral("Registration confirmation failed."));
+        if (!runId.isEmpty()) {
+            QSqlQuery run(db);
+            run.prepare(QStringLiteral("UPDATE module_run SET status='VALID' WHERE run_id=? AND status='REVIEW'"));
+            run.addBindValue(runId);
+            if (!run.exec() || run.numRowsAffected() != 1)
+                return fail(run.lastError().isValid() ? run.lastError().text() :
+                    QStringLiteral("Registration run is not awaiting review."));
+        }
+        if (converted > 0) {
+            QSqlQuery cameraRun(db);
+            cameraRun.prepare(QStringLiteral("INSERT INTO module_run VALUES(?,?,?,?,?,?,?)"));
+            cameraRun.addBindValue(QUuid::createUuid().toString(QUuid::WithoutBraces));
+            cameraRun.addBindValue(inspectionId.isEmpty() ? QVariant() : QVariant(inspectionId));
+            cameraRun.addBindValue(QStringLiteral("camera_pose"));
+            cameraRun.addBindValue(QStringLiteral("VALID"));
+            cameraRun.addBindValue(confirmedAt);
+            cameraRun.addBindValue(confirmedAt);
+            cameraRun.addBindValue(QStringLiteral(""));
+            if (!cameraRun.exec()) return fail(cameraRun.lastError().text());
+        }
+        if (!db.commit()) return fail(db.lastError().text());
+        if (poseCount) *poseCount = converted;
+        return true;
     });
 }
 

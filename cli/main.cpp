@@ -2,6 +2,7 @@
 #include "project_archive.h"
 #include "conversion_core.h"
 #include "image_correction.h"
+#include "damage_store.h"
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -15,8 +16,10 @@
 #include <QTemporaryDir>
 #include <QTextStream>
 #include <QSqlDatabase>
+#include <QSqlError>
 #include <QSqlQuery>
 #include <QUuid>
+#include <QVariant>
 
 int main(int argc, char *argv[]) {
     QCoreApplication app(argc, argv);
@@ -80,6 +83,18 @@ int main(int argc, char *argv[]) {
         }
         out << datasetId << "\timages=" << scan.images.size() << "\tclouds=" << scan.clouds.size() << Qt::endl;
         return 0;
+    }
+    if (args.size() == 5 && args[1] == QStringLiteral("damage-import")) {
+        DamageImportReport report;
+        if (!ConversionCore::ensureSchema(args[2], &error) ||
+            !DamageStore::importFolder(args[2], args[3], args[4], &report, &error)) {
+            err << error << Qt::endl;
+            return 1;
+        }
+        out << "images=" << report.images << "\tobjects=" << report.objects
+            << "\twarnings=" << report.warnings.size() << Qt::endl;
+        for (const auto &warning : report.warnings) err << warning << Qt::endl;
+        return report.images > 0 ? 0 : 1;
     }
     if (args.size() == 5 && args[1] == QStringLiteral("convert-correct")) {
         CorrectionResult result;
@@ -374,6 +389,183 @@ int main(int argc, char *argv[]) {
             err << "adoption/dependency test failed" << Qt::endl;
             return 1;
         }
+        const auto pendingRunId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        if (!ProjectStore::recordRun(path, {pendingRunId, inspections[0].id, QStringLiteral("registration"),
+                QStringLiteral("RUNNING"), now, {}, {}}, &error)
+            || !ProjectStore::finishRun(path, pendingRunId, QStringLiteral("REVIEW"), {}, &error)
+            || !ProjectStore::runs(path, inspections[0].id, &runs, &error)) {
+            err << "run completion test failed: " << error << Qt::endl;
+            return 1;
+        }
+        bool completed = false;
+        for (const auto &run : runs)
+            if (run.id == pendingRunId)
+                completed = run.status == QStringLiteral("REVIEW") && !run.finishedAt.isEmpty();
+        if (!completed || ProjectStore::finishRun(path, pendingRunId, QStringLiteral("VALID"), {}, &error)) {
+            err << "run state transition test failed" << Qt::endl;
+            return 1;
+        }
+        error.clear();
+        if (!ConversionCore::ensureSchema(path, &error) ||
+            !ProjectStore::ensureRegistrationSchema(path, &error)) {
+            err << "registration review schema failed: " << error << Qt::endl;
+            return 1;
+        }
+        const auto datasetId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const auto imageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const auto oldRegistration = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const auto candidateId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        const QString matrixJson = QString::fromUtf8(QJsonDocument(QJsonArray{
+            QJsonArray{1, 0, 0, 10}, QJsonArray{0, 1, 0, 20},
+            QJsonArray{0, 0, 1, 30}, QJsonArray{0, 0, 0, 1}
+        }).toJson(QJsonDocument::Compact));
+        const QString initialPose = QString::fromUtf8(QJsonDocument(QJsonObject{
+            {QStringLiteral("position"), QJsonObject{{QStringLiteral("x"), 1},
+                {QStringLiteral("y"), 2}, {QStringLiteral("z"), 3}}},
+            {QStringLiteral("orientation"), QJsonObject{{QStringLiteral("w"), 1},
+                {QStringLiteral("x"), 0}, {QStringLiteral("y"), 0}, {QStringLiteral("z"), 0}}}
+        }).toJson(QJsonDocument::Compact));
+        {
+            const QString connection = QStringLiteral("registration-review-test");
+            {
+                auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
+                db.setDatabaseName(path);
+                if (!db.open()) return 1;
+                QSqlQuery query(db);
+                auto execute = [&](const QString &sql, const QVariantList &values) {
+                    query.prepare(sql);
+                    for (const auto &value : values) query.addBindValue(value);
+                    if (query.exec()) return true;
+                    error = query.lastError().text();
+                    return false;
+                };
+                const bool prepared =
+                    execute(QStringLiteral("INSERT INTO dataset VALUES(?,?,?,?,?,?,?)"),
+                        {datasetId, inspections[0].id, QStringLiteral("Review"), QStringLiteral("ELIOS"),
+                         QStringLiteral("fixture-source"), QStringLiteral("VALID"), now}) &&
+                    execute(QStringLiteral("INSERT INTO image(image_id,dataset_id,source_identifier,raw_path,width,height,include_state) "
+                        "VALUES(?,?,?,?,?,?,?)"),
+                        {imageId, datasetId, QStringLiteral("image-1"), QStringLiteral("fixture.jpg"), 100, 100,
+                         QStringLiteral("INCLUDED")}) &&
+                    execute(QStringLiteral("INSERT INTO camera_pose VALUES(?,?,?,?,?,?)"),
+                        {QUuid::createUuid().toString(QUuid::WithoutBraces), imageId,
+                         QStringLiteral("INITIAL"), initialPose, QStringLiteral("DEVICE"), QStringLiteral("VALID")}) &&
+                    execute(QStringLiteral("INSERT INTO registration_result "
+                        "(registration_id,inspection_id,dataset_id,source_cloud_path,model_root,method,matrix_json,"
+                        "scale,pose_frame_confirmed,created_at,active,review_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"),
+                        {oldRegistration, inspections[0].id, datasetId, QStringLiteral("fixture.las"),
+                         QStringLiteral("fixture-model"), QStringLiteral("OLD"), matrixJson, 1, 0, now, 1,
+                         QStringLiteral("CONFIRMED")}) &&
+                    execute(QStringLiteral("INSERT INTO registration_result "
+                        "(registration_id,inspection_id,dataset_id,source_cloud_path,model_root,method,matrix_json,"
+                        "scale,pose_frame_confirmed,created_at,active,review_status,run_id) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"),
+                        {candidateId, inspections[0].id, datasetId, QStringLiteral("fixture.las"),
+                         QStringLiteral("fixture-model"), QStringLiteral("NEW"), matrixJson, 1, 1, now, 0,
+                         QStringLiteral("PENDING"), pendingRunId});
+                db.close();
+                if (!prepared) { err << "review fixture failed: " << error << Qt::endl; return 1; }
+            }
+            QSqlDatabase::removeDatabase(connection);
+        }
+        QList<RegistrationReviewInfo> pending;
+        int alignedCount = -1;
+        if (!ProjectStore::pendingRegistrations(path, inspections[0].id, &pending, &error) ||
+            pending.size() != 1 || pending[0].id != candidateId) {
+            err << "pending registration lookup failed: " << error << Qt::endl;
+            return 1;
+        }
+        {
+            const QString connection = QStringLiteral("registration-review-before");
+            {
+                auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
+                db.setDatabaseName(path);
+                if (!db.open()) return 1;
+                QSqlQuery query(db);
+                query.prepare(QStringLiteral("SELECT active FROM registration_result WHERE registration_id=?"));
+                query.addBindValue(oldRegistration);
+                if (!query.exec() || !query.next() || query.value(0).toInt() != 1) return 1;
+                query.prepare(QStringLiteral("SELECT count(*) FROM camera_pose WHERE image_id=? AND pose_stage='MODEL_ALIGNED'"));
+                query.addBindValue(imageId);
+                if (!query.exec() || !query.next() || query.value(0).toInt() != 0) return 1;
+                db.close();
+            }
+            QSqlDatabase::removeDatabase(connection);
+        }
+        if (
+            !ProjectStore::confirmRegistration(path, candidateId, &alignedCount, &error) || alignedCount != 1 ||
+            ProjectStore::confirmRegistration(path, candidateId, &alignedCount, &error)) {
+            err << "registration review transition failed: " << error << Qt::endl;
+            return 1;
+        }
+        error.clear();
+        {
+            const QString connection = QStringLiteral("registration-review-check");
+            {
+                auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
+                db.setDatabaseName(path);
+                if (!db.open()) return 1;
+                QSqlQuery query(db);
+                query.prepare(QStringLiteral("SELECT active,review_status FROM registration_result WHERE registration_id=?"));
+                query.addBindValue(candidateId);
+                if (!query.exec() || !query.next() ||
+                    query.value(0).toInt() != 1 || query.value(1).toString() != QStringLiteral("CONFIRMED"))
+                    return 1;
+                query.prepare(QStringLiteral("SELECT active FROM registration_result WHERE registration_id=?"));
+                query.addBindValue(oldRegistration);
+                if (!query.exec() || !query.next() || query.value(0).toInt() != 0) return 1;
+                query.prepare(QStringLiteral("SELECT pose_json FROM camera_pose WHERE image_id=? AND pose_stage='MODEL_ALIGNED'"));
+                query.addBindValue(imageId);
+                if (!query.exec() || !query.next()) return 1;
+                const auto position = QJsonDocument::fromJson(query.value(0).toString().toUtf8())
+                    .object().value(QStringLiteral("position")).toObject();
+                if (position.value(QStringLiteral("x")).toDouble() != 11 ||
+                    position.value(QStringLiteral("y")).toDouble() != 22 ||
+                    position.value(QStringLiteral("z")).toDouble() != 33) return 1;
+                db.close();
+            }
+            QSqlDatabase::removeDatabase(connection);
+        }
+        const auto noPoseCandidate = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        {
+            const QString connection = QStringLiteral("registration-review-no-pose-insert");
+            {
+                auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
+                db.setDatabaseName(path);
+                if (!db.open()) return 1;
+                QSqlQuery query(db);
+                query.prepare(QStringLiteral("INSERT INTO registration_result "
+                    "(registration_id,inspection_id,dataset_id,source_cloud_path,model_root,method,matrix_json,"
+                    "scale,pose_frame_confirmed,created_at,active,review_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"));
+                for (const auto &value : QVariantList{noPoseCandidate, inspections[0].id, datasetId,
+                     QStringLiteral("fixture.las"), QStringLiteral("fixture-model"), QStringLiteral("NO_POSE"),
+                     matrixJson, 1, 0, now, 0, QStringLiteral("PENDING")}) query.addBindValue(value);
+                if (!query.exec()) return 1;
+                db.close();
+            }
+            QSqlDatabase::removeDatabase(connection);
+        }
+        if (!ProjectStore::confirmRegistration(path, noPoseCandidate, &alignedCount, &error) || alignedCount != 0) {
+            err << "registration without camera transform failed: " << error << Qt::endl;
+            return 1;
+        }
+        {
+            const QString connection = QStringLiteral("registration-review-no-pose-check");
+            {
+                auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
+                db.setDatabaseName(path);
+                if (!db.open()) return 1;
+                QSqlQuery query(db);
+                query.prepare(QStringLiteral("SELECT count(*) FROM camera_pose WHERE image_id=? AND pose_stage='MODEL_ALIGNED'"));
+                query.addBindValue(imageId);
+                if (!query.exec() || !query.next() || query.value(0).toInt() != 0) return 1;
+                query.prepare(QStringLiteral("SELECT active FROM registration_result WHERE registration_id=?"));
+                query.addBindValue(candidateId);
+                if (!query.exec() || !query.next() || query.value(0).toInt() != 0) return 1;
+                db.close();
+            }
+            QSqlDatabase::removeDatabase(connection);
+        }
         QTemporaryDir archive;
         QTemporaryDir restored;
         ProjectInfo restoredInfo;
@@ -428,6 +620,6 @@ int main(int argc, char *argv[]) {
         out << "self-test passed" << Qt::endl;
         return 0;
     }
-    err << "Usage: InspectionCli create <existing-empty-directory> | info <project.sqlite> | add-facility <project.sqlite> <name> <type> | add-inspection <project.sqlite> <facility-id> <name> <type> | self-test" << Qt::endl;
+    err << "Usage: InspectionCli create <existing-empty-directory> | info <project.sqlite> | add-facility <project.sqlite> <name> <type> | add-inspection <project.sqlite> <facility-id> <name> <type> | damage-import <project.sqlite> <dataset-id> <json-folder> | self-test" << Qt::endl;
     return 2;
 }

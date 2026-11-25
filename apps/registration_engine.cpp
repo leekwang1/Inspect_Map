@@ -4,8 +4,10 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QMatrix3x3>
 #include <QMatrix4x4>
+#include <QTextStream>
 #include <QXmlStreamReader>
 #include <algorithm>
 #include <cmath>
@@ -79,6 +81,89 @@ bool nonCollinear(const QVector<QVector3D> &points) {
             }
     return false;
 }
+
+bool classifiedFaces(const QString &path, const QMatrix4x4 &coordinate,
+                     vtkSmartPointer<vtkPolyData> *exterior,
+                     vtkSmartPointer<vtkPolyData> *interior, QString *error) {
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        if (error) *error = file.errorString();
+        return false;
+    }
+    struct FaceBuilder {
+        vtkSmartPointer<vtkPoints> points = vtkSmartPointer<vtkPoints>::New();
+        vtkSmartPointer<vtkCellArray> faces = vtkSmartPointer<vtkCellArray>::New();
+        QHash<int, vtkIdType> indices;
+    } outer, inner;
+    QVector<QVector3D> vertices;
+    FaceBuilder *active = nullptr;
+    QTextStream stream(&file);
+    while (!stream.atEnd()) {
+        const QString line = stream.readLine().trimmed();
+        if (line.isEmpty() || line.startsWith(QLatin1Char('#'))) continue;
+        const QStringList fields = line.simplified().split(QLatin1Char(' '));
+        if (fields[0] == QStringLiteral("v") && fields.size() >= 4) {
+            bool xOk = false, yOk = false, zOk = false;
+            const float x = fields[1].toFloat(&xOk);
+            const float y = fields[2].toFloat(&yOk);
+            const float z = fields[3].toFloat(&zOk);
+            if (!xOk || !yOk || !zOk) {
+                if (error) *error = QStringLiteral("Invalid OBJ vertex: ") + path;
+                return false;
+            }
+            vertices.append(coordinate.map(QVector3D(x, y, z)));
+        } else if (fields[0] == QStringLiteral("g")) {
+            active = nullptr;
+            for (const auto &name : fields.mid(1)) {
+                if (name.contains(QStringLiteral("-EX-"), Qt::CaseInsensitive)) active = &outer;
+                if (name.contains(QStringLiteral("-IN-"), Qt::CaseInsensitive)) active = &inner;
+            }
+        } else if (fields[0] == QStringLiteral("f") && active) {
+            if (fields.size() < 4) {
+                if (error) *error = QStringLiteral("Invalid OBJ face: ") + path;
+                return false;
+            }
+            QVector<int> vertexIds;
+            for (const auto &token : fields.mid(1)) {
+                if (token.startsWith(QLatin1Char('#'))) break;
+                bool parsed = false;
+                int index = token.section(QLatin1Char('/'), 0, 0).toInt(&parsed);
+                if (index < 0) index = vertices.size() + index;
+                else --index;
+                if (!parsed || index < 0 || index >= vertices.size()) {
+                    if (error) *error = QStringLiteral("Invalid OBJ face index: ") + path;
+                    return false;
+                }
+                vertexIds.append(index);
+            }
+            if (vertexIds.size() < 3) {
+                if (error) *error = QStringLiteral("Invalid OBJ face: ") + path;
+                return false;
+            }
+            active->faces->InsertNextCell(vertexIds.size());
+            for (const int index : vertexIds) {
+                auto found = active->indices.constFind(index);
+                vtkIdType pointId;
+                if (found == active->indices.cend()) {
+                    const auto &point = vertices[index];
+                    pointId = active->points->InsertNextPoint(point.x(), point.y(), point.z());
+                    active->indices.insert(index, pointId);
+                } else pointId = found.value();
+                active->faces->InsertCellPoint(pointId);
+            }
+        }
+    }
+    auto build = [](const FaceBuilder &builder) {
+        if (builder.faces->GetNumberOfCells() == 0) return vtkSmartPointer<vtkPolyData>{};
+        auto mesh = vtkSmartPointer<vtkPolyData>::New();
+        mesh->SetPoints(builder.points);
+        mesh->SetPolys(builder.faces);
+        return mesh;
+    };
+    *exterior = build(outer);
+    *interior = build(inner);
+    return true;
+}
 }
 
 bool RegistrationEngine::loadModel(const QString &root, double fallbackScale,
@@ -113,8 +198,10 @@ bool RegistrationEngine::loadModel(const QString &root, double fallbackScale,
             vertices->SetPoint(i, q.x(), q.y(), q.z());
         }
         vertices->Modified();
+        vtkSmartPointer<vtkPolyData> exterior, interior;
+        if (!classifiedFaces(path, coordinate, &exterior, &interior, error)) return false;
         append->AddInputData(geometry);
-        loaded.append({QFileInfo(path).baseName(), geometry});
+        loaded.append({QFileInfo(path).baseName(), geometry, exterior, interior});
     }
     if (loaded.isEmpty()) {
         if (error) *error = QStringLiteral("No OBJ files found in model directory.");
@@ -171,7 +258,7 @@ bool RegistrationEngine::landmarks(const QVector<QVector3D> &source,
 }
 
 bool RegistrationEngine::icp(vtkPolyData *source, vtkPolyData *target,
-                             vtkMatrix4x4 *initial, vtkMatrix4x4 *matrix,
+                             vtkMatrix4x4 *initial, bool allowScale, vtkMatrix4x4 *matrix,
                              int *iterations, QString *error) {
     if (!source || !target || !matrix || source->GetNumberOfPoints() < 3 ||
         target->GetNumberOfCells() < 3) {
@@ -187,7 +274,8 @@ bool RegistrationEngine::icp(vtkPolyData *source, vtkPolyData *target,
     vtkNew<vtkIterativeClosestPointTransform> fit;
     fit->SetSource(prepared->GetOutput());
     fit->SetTarget(target);
-    fit->GetLandmarkTransform()->SetModeToRigidBody();
+    if (allowScale) fit->GetLandmarkTransform()->SetModeToSimilarity();
+    else fit->GetLandmarkTransform()->SetModeToRigidBody();
     fit->SetMaximumNumberOfIterations(80);
     fit->SetMaximumNumberOfLandmarks(5000);
     fit->SetMaximumMeanDistance(0.001);
@@ -196,6 +284,11 @@ bool RegistrationEngine::icp(vtkPolyData *source, vtkPolyData *target,
     fit->Update();
     if (initial) vtkMatrix4x4::Multiply4x4(fit->GetMatrix(), initial, matrix);
     else matrix->DeepCopy(fit->GetMatrix());
+    const double scale = uniformScale(matrix);
+    if (!std::isfinite(scale) || scale < 1e-12) {
+        if (error) *error = QStringLiteral("ICP produced an invalid scale.");
+        return false;
+    }
     if (iterations) *iterations = fit->GetNumberOfIterations();
     return true;
 }

@@ -88,3 +88,58 @@ and the operator confirms the camera poses share the LAS coordinate frame.
 The current viewer reads uncompressed LAS; PLY and other SfM point-cloud formats
 are still to be added. `registration_engine` tests rigid/similarity fitting,
 camera orientation, ICP and the sample model's unit transform.
+
+## Inspection Map Editor (first working slice)
+
+`InspectionMapEditor` opens from Project Manager or with
+`--project <project.sqlite> [--inspection <id>]`. It requires a confirmed,
+active registration, `MODEL_ALIGNED` camera poses from that registration,
+corrected image variants with a stored `P` camera matrix, reviewed/accepted
+damage objects, and `model/` plus `map/` directories. The current loader reads
+OBJ face-group IDs, `meta.gxxml`, and ASCII DXF 3D `POLYLINE` entities with
+`SPG_PY3` `FACE_ID` data. Unsupported or missing metadata is an input error,
+not a guessed coordinate transform.
+
+The first ray hit on the model determines a candidate part and face for each
+sampled damage line or polygon. A result is marked `NEEDS_REVIEW` if rays miss,
+cross faces, lack a matching drawing, or cannot support a 3D length/area
+measurement. Accepted results and review-needed results are stored in versioned
+`map_projection_run` and `map_projection_item` tables; reruns keep prior runs.
+The editor lists parts and drawing directions. Its default view places all
+available `map/` DXF directions for one part on a single sheet, with EX and IN
+separated only when the model identifies them. The per-part A1 PDF exports this
+layout as a **draft**, with green damage numbers and a matching quantity table.
+The editor also exports a standalone HTML drawing and an `.xlsx` quantity
+schedule using the same numbers. These numbers identify projected objects,
+not yet merged physical defects seen in multiple images; length and area are
+the current 3D projection estimates.
+
+Projection results needing review can be deferred or excluded without changing
+the accepted AI object or the original automatic projection row. A reviewer may
+inspect the corrected image with its detection overlay, then
+choose a part, drawing and model face, click two or more points for a line or
+three or more for an area, and confirm only after those points map to that face
+and a 3D length or area is calculated. Review decisions are saved separately
+for the active projection run and can be reset. Re-running projection creates
+a new run with its own review decisions.
+
+The optional side-unroll view uses `unroll/` DXF face blocks and placements
+when available, matching `FACE_ID` to OBJ faces and mapping projected 3D
+damage coordinates by triangle barycentric interpolation. Without a source
+unroll DXF, a model-only sheet is generated only for connected vertical
+prismatic quad surfaces whose perimeter can be traversed without branches.
+Unsupported geometry has no unroll option; the map sheet remains available.
+The UI and PDF identify whether the unroll came from DXF or the model.
+EX/IN are separated when face IDs distinguish them; otherwise one sheet is
+shown. Projected damage on faces outside the sheet is counted as excluded.
+Check the draft against source drawings before publishing measurements.
+The batch export also accepts `--mode unroll` with `--export-part` and `--output`.
+
+`--run-projection` runs the selected dataset once without a dialog. The current
+PDF is a draft because duplicate observations across images are not merged,
+review-needed items do not yet have a 3D manual correction interface, and
+general freeform surface unfolding and explicit seam editing are not yet
+implemented. Image-wide candidate-part classification
+and final report/quantity approval are also not yet implemented. The sample
+engine and workflow tests use the test model and a temporary copy of the
+project database; they do not change the original test project.

@@ -38,7 +38,7 @@ set_target_properties(OpenCVWorld PROPERTIES
 
 add_library(InspectCore STATIC core/project_store.cpp core/project_store.h core/project_archive.cpp core/project_archive.h
     core/conversion_core.cpp core/conversion_core.h core/input_adapters.cpp core/input_adapters.h
-    core/image_correction.cpp core/image_correction.h)
+    core/image_correction.cpp core/image_correction.h core/damage_store.cpp core/damage_store.h)
 target_link_libraries(InspectCore PUBLIC Qt6::Core Qt6::Gui Qt6::Sql OpenCVWorld)
 target_include_directories(InspectCore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/core ${OpenCV_INCLUDE_DIR})
 
@@ -51,6 +51,10 @@ deploy_qt_runtime(InspectionCli)
 add_executable(ProjectManager WIN32 apps/project_manager.cpp)
 target_link_libraries(ProjectManager PRIVATE InspectCore Qt6::Widgets)
 deploy_qt_runtime(ProjectManager)
+
+add_executable(AIDamageManager WIN32 apps/ai_damage_manager.cpp)
+target_link_libraries(AIDamageManager PRIVATE InspectCore Qt6::Widgets)
+deploy_qt_runtime(AIDamageManager)
 
 add_executable(DataConverter WIN32 apps/data_converter.cpp apps/lidar_preview.cpp apps/lidar_preview.h)
 target_link_libraries(DataConverter PRIVATE InspectCore Qt6::Widgets)
@@ -103,8 +107,69 @@ add_custom_command(TARGET RegistrationEngineTest POST_BUILD
         ${VTK_RUNTIME_DLLS} $<TARGET_FILE_DIR:RegistrationEngineTest> VERBATIM)
 deploy_qt_runtime(RegistrationEngineTest)
 
+add_executable(RegistrationPreviewUiTest cli/registration_preview_ui_test.cpp
+    apps/lidar_preview.cpp apps/lidar_preview.h)
+target_compile_definitions(RegistrationPreviewUiTest PRIVATE INSPECTMAP_WITH_VTK)
+target_link_libraries(RegistrationPreviewUiTest PRIVATE RegistrationEngine InspectCore Qt6::Widgets Qt6::Sql
+    Qt6::OpenGLWidgets VTK::RenderingCore VTK::RenderingOpenGL2
+    VTK::InteractionStyle VTK::GUISupportQt VTK::FiltersSources)
+vtk_module_autoinit(TARGETS RegistrationPreviewUiTest MODULES ${VTK_LIBRARIES})
+add_custom_command(TARGET RegistrationPreviewUiTest POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${VTK_RUNTIME_DLLS} $<TARGET_FILE_DIR:RegistrationPreviewUiTest> VERBATIM)
+add_custom_command(TARGET RegistrationPreviewUiTest POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:OpenCVWorld> $<TARGET_FILE_DIR:RegistrationPreviewUiTest>)
+deploy_qt_runtime(RegistrationPreviewUiTest)
+
+add_library(InspectionMapEngine STATIC apps/inspection_map_engine.cpp apps/inspection_map_engine.h
+    apps/inspection_map_workflow.cpp apps/inspection_map_workflow.h)
+target_link_libraries(InspectionMapEngine PUBLIC Qt6::Core Qt6::Gui Qt6::Sql)
+target_include_directories(InspectionMapEngine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/apps)
+
+add_executable(InspectionMapEditor WIN32 apps/inspection_map_editor.cpp)
+target_link_libraries(InspectionMapEditor PRIVATE InspectionMapEngine InspectCore Qt6::Widgets)
+add_custom_command(TARGET InspectionMapEditor POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:OpenCVWorld> $<TARGET_FILE_DIR:InspectionMapEditor>)
+deploy_qt_runtime(InspectionMapEditor)
+
+add_executable(InspectionMapEngineTest cli/inspection_map_engine_test.cpp)
+target_link_libraries(InspectionMapEngineTest PRIVATE InspectionMapEngine)
+deploy_qt_runtime(InspectionMapEngineTest)
+
 
 enable_testing()
 add_test(NAME project_store_smoke COMMAND InspectionCli self-test)
 add_test(NAME converter_smoke COMMAND InspectionCli converter-self-test)
 add_test(NAME registration_engine COMMAND RegistrationEngineTest)
+add_test(NAME registration_preview_ui COMMAND RegistrationPreviewUiTest
+    "${CMAKE_SOURCE_DIR}/Test/Project/project.sqlite")
+add_test(NAME inspection_map_engine COMMAND InspectionMapEngineTest
+    "${CMAKE_SOURCE_DIR}/Test/Data/model")
+
+add_executable(InspectionMapWorkflowTest cli/inspection_map_workflow_test.cpp)
+target_link_libraries(InspectionMapWorkflowTest PRIVATE InspectionMapEngine)
+deploy_qt_runtime(InspectionMapWorkflowTest)
+add_test(NAME inspection_map_workflow COMMAND InspectionMapWorkflowTest
+    "${CMAKE_SOURCE_DIR}/Test/Project/project.sqlite" "${CMAKE_SOURCE_DIR}/Test/Data/model")
+
+add_executable(InspectionMapUiTest cli/inspection_map_ui_test.cpp)
+target_link_libraries(InspectionMapUiTest PRIVATE InspectionMapEngine InspectCore Qt6::Widgets)
+add_custom_command(TARGET InspectionMapUiTest POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:OpenCVWorld> $<TARGET_FILE_DIR:InspectionMapUiTest>)
+deploy_qt_runtime(InspectionMapUiTest)
+add_test(NAME inspection_map_ui COMMAND InspectionMapUiTest
+    "${CMAKE_SOURCE_DIR}/Test/Project/project.sqlite")
+
+add_executable(DamageStoreTest cli/damage_store_test.cpp)
+target_link_libraries(DamageStoreTest PRIVATE InspectCore)
+add_custom_command(TARGET DamageStoreTest POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:OpenCVWorld> $<TARGET_FILE_DIR:DamageStoreTest>)
+deploy_qt_runtime(DamageStoreTest)
+add_test(NAME damage_store COMMAND DamageStoreTest "${CMAKE_SOURCE_DIR}/Test/Data/detect/json")
+
+add_executable(AIDamageUiTest cli/ai_damage_ui_test.cpp)
+target_link_libraries(AIDamageUiTest PRIVATE InspectCore Qt6::Widgets)
+add_custom_command(TARGET AIDamageUiTest POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:OpenCVWorld> $<TARGET_FILE_DIR:AIDamageUiTest>)
+deploy_qt_runtime(AIDamageUiTest)
+add_test(NAME damage_ui_review_switch COMMAND AIDamageUiTest
+    "${CMAKE_SOURCE_DIR}/Test/Project/project.sqlite" "${CMAKE_SOURCE_DIR}/Test/Data/detect/json")

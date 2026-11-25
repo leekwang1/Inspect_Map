@@ -10,6 +10,7 @@
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
@@ -18,12 +19,17 @@
 #include <QPushButton>
 #include <QSettings>
 #include <QSet>
+#include <QSqlDatabase>
+#include <QSqlQuery>
+#include <QSqlRecord>
 #include <QSplitter>
 #include <QTableWidget>
 #include <QTabWidget>
 #include <QTimer>
 #include <QTreeWidget>
+#include <QUuid>
 #include <QVBoxLayout>
+#include <algorithm>
 #include <iterator>
 
 namespace {
@@ -39,9 +45,114 @@ constexpr ModuleDefinition modules[] = {
     {"ai_damage", "AI 손상정보", "AIDamageManager"},
     {"projection", "손상 3D 투영", "InspectionMapEditor"},
     {"quantity", "손상 물량 계산", "InspectionMapEditor"},
-    {"map", "외관조사망도", "InspectionMapEditor"},
-    {"report", "보고서", "ReportGenerator"}
+    {"map", "외관조사망도·산출물", "InspectionMapEditor"}
 };
+
+struct WorkCounts {
+    int datasets = 0;
+    int images = 0;
+    int corrected = 0;
+    int clouds = 0;
+    int registrations = 0;
+    int alignedPoses = 0;
+    int damageImages = 0;
+    int damageObjects = 0;
+    int damagePending = 0;
+    int mapRuns = 0;
+    int projectedDamages = 0;
+    int projectionPending = 0;
+    int mapParts = 0;
+    int measuredDamages = 0;
+};
+
+WorkCounts readWorkCounts(const QString &projectDb, const QString &inspectionId) {
+    WorkCounts result;
+    const QString connection = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    {
+        auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
+        db.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY"));
+        db.setDatabaseName(projectDb);
+        if (db.open()) {
+            const auto tables = db.tables();
+            auto count = [&](const QString &statement) {
+                QSqlQuery query(db);
+                query.prepare(statement);
+                const QString scope = inspectionId.isEmpty() ? QStringLiteral("") : inspectionId;
+                query.addBindValue(scope);
+                query.addBindValue(scope);
+                return query.exec() && query.next() ? query.value(0).toInt() : 0;
+            };
+            if (tables.contains(QStringLiteral("dataset"))) {
+                result.datasets = count(QStringLiteral("SELECT count(*) FROM dataset d "
+                    "WHERE (?='' OR d.inspection_id=? OR d.inspection_id IS NULL)"));
+                result.clouds = count(QStringLiteral("SELECT count(*) FROM point_cloud c "
+                    "JOIN dataset d ON d.dataset_id=c.dataset_id "
+                    "WHERE (?='' OR d.inspection_id=? OR d.inspection_id IS NULL)"));
+                result.images = count(QStringLiteral("SELECT count(*) FROM image i "
+                    "JOIN dataset d ON d.dataset_id=i.dataset_id "
+                    "WHERE (?='' OR d.inspection_id=? OR d.inspection_id IS NULL)"));
+                result.corrected = count(QStringLiteral("SELECT count(*) FROM image_variant v "
+                    "JOIN image i ON i.image_id=v.image_id JOIN dataset d ON d.dataset_id=i.dataset_id "
+                    "WHERE v.variant_type='DEVICE_UNDISTORTED' AND v.status='VALID' AND v.is_active=1 "
+                    "AND (?='' OR d.inspection_id=? OR d.inspection_id IS NULL)"));
+                result.alignedPoses = count(QStringLiteral("SELECT count(*) FROM camera_pose p "
+                    "JOIN image i ON i.image_id=p.image_id JOIN dataset d ON d.dataset_id=i.dataset_id "
+                    "WHERE p.pose_stage='MODEL_ALIGNED' "
+                    "AND (?='' OR d.inspection_id=? OR d.inspection_id IS NULL)"));
+            }
+            if (tables.contains(QStringLiteral("registration_result"))) {
+                if (db.record(QStringLiteral("registration_result")).indexOf(QStringLiteral("inspection_id")) >= 0)
+                    result.registrations = count(QStringLiteral("SELECT count(*) FROM registration_result r "
+                        "WHERE r.active=1 AND (?='' OR r.inspection_id=? OR r.inspection_id IS NULL)"));
+                else {
+                    QSqlQuery query(db);
+                    if (query.exec(QStringLiteral("SELECT count(*) FROM registration_result WHERE active=1")) && query.next())
+                        result.registrations = query.value(0).toInt();
+                }
+            }
+            if (tables.contains(QStringLiteral("damage_result"))) {
+                result.damageImages = count(QStringLiteral("SELECT count(*) FROM damage_result r "
+                    "JOIN dataset d ON d.dataset_id=r.dataset_id WHERE r.active=1 "
+                    "AND (?='' OR d.inspection_id=? OR d.inspection_id IS NULL)"));
+                result.damageObjects = count(QStringLiteral("SELECT count(*) FROM damage_object o "
+                    "JOIN damage_result r ON r.result_id=o.result_id JOIN dataset d ON d.dataset_id=r.dataset_id "
+                    "WHERE r.active=1 AND o.review_state!='REJECTED' AND substr(o.type,1,7)!='target_' "
+                    "AND (?='' OR d.inspection_id=? OR d.inspection_id IS NULL)"));
+                const bool tracksReview = db.record(QStringLiteral("damage_object"))
+                    .indexOf(QStringLiteral("review_confirmed")) >= 0;
+                result.damagePending = count(QStringLiteral("SELECT count(*) FROM damage_object o "
+                    "JOIN damage_result r ON r.result_id=o.result_id JOIN dataset d ON d.dataset_id=r.dataset_id "
+                    "WHERE r.active=1 AND ") +
+                    (tracksReview ? QStringLiteral("(o.review_confirmed=0 OR o.review_state='HOLD') ") :
+                        QStringLiteral("o.review_state IN ('UNREVIEWED','HOLD') ")) +
+                    QStringLiteral("AND substr(o.type,1,7)!='target_' "
+                    "AND (?='' OR d.inspection_id=? OR d.inspection_id IS NULL)"));
+            }
+            if (tables.contains(QStringLiteral("map_projection_run")) &&
+                tables.contains(QStringLiteral("map_projection_item"))) {
+                result.mapRuns = count(QStringLiteral("SELECT count(*) FROM map_projection_run r "
+                    "WHERE r.active=1 AND (?='' OR r.inspection_id=?)"));
+                result.projectedDamages = count(QStringLiteral("SELECT count(*) FROM map_projection_item i "
+                    "JOIN map_projection_run r ON r.run_id=i.run_id WHERE r.active=1 "
+                    "AND i.status='PROJECTED' AND (?='' OR r.inspection_id=?)"));
+                result.projectionPending = count(QStringLiteral("SELECT count(*) FROM map_projection_item i "
+                    "JOIN map_projection_run r ON r.run_id=i.run_id WHERE r.active=1 "
+                    "AND i.status!='PROJECTED' AND (?='' OR r.inspection_id=?)"));
+                result.mapParts = count(QStringLiteral("SELECT count(DISTINCT i.part_id) "
+                    "FROM map_projection_item i JOIN map_projection_run r ON r.run_id=i.run_id "
+                    "WHERE r.active=1 AND i.status='PROJECTED' AND i.part_id!='' "
+                    "AND (?='' OR r.inspection_id=?)"));
+                result.measuredDamages = count(QStringLiteral("SELECT count(*) FROM map_projection_item i "
+                    "JOIN map_projection_run r ON r.run_id=i.run_id WHERE r.active=1 "
+                    "AND i.status='PROJECTED' AND (i.length_mm>0 OR i.area_mm2>0) "
+                    "AND (?='' OR r.inspection_id=?)"));
+            }
+            db.close();
+        }
+    }
+    QSqlDatabase::removeDatabase(connection);
+    return result;
+}
 
 QStringList recentPaths() {
     return QSettings(QStringLiteral("InspectMap"), QStringLiteral("ProjectManager"))
@@ -132,17 +243,16 @@ private:
         tree_ = new QTreeWidget;
         tree_->setHeaderHidden(true);
         navLayout->addWidget(tree_, 1);
-        auto *datasets = new QLabel(QStringLiteral("데이터 세트 · 변환기 구현 후 표시"));
-        datasets->setObjectName(QStringLiteral("muted"));
-        datasets->setWordWrap(true);
-        navLayout->addWidget(datasets);
+        datasetsLabel_ = new QLabel(QStringLiteral("등록된 데이터 세트 없음"));
+        datasetsLabel_->setObjectName(QStringLiteral("muted"));
+        datasetsLabel_->setWordWrap(true);
+        navLayout->addWidget(datasetsLabel_);
         navLayout->addWidget(heading(QStringLiteral("프로그램")));
         const struct { const char *executable; const char *label; } programs[] = {
             {"DataConverter", "데이터 변환기"},
             {"RegistrationTool", "정합 작업기"},
             {"AIDamageManager", "AI 손상정보 관리자"},
-            {"InspectionMapEditor", "외관망도 작성기"},
-            {"ReportGenerator", "보고서 생성기"}
+            {"InspectionMapEditor", "외관망도 작성기"}
         };
         for (const auto &program : programs) {
             auto *button = new QPushButton(QString::fromUtf8(program.label));
@@ -162,6 +272,9 @@ private:
         tabs_->addTab(buildPipelineTab(), QStringLiteral("파이프라인"));
         tabs_->addTab(buildHistoryTab(), QStringLiteral("산출물·이력"));
         for (int i = 1; i < tabs_->count(); ++i) tabs_->setTabEnabled(i, false);
+        connect(tabs_, &QTabWidget::currentChanged, this, [this](int index) {
+            if (index == 1 && !projectDb_.isEmpty()) { refreshWork(); refreshHistory(); }
+        });
         splitter->addWidget(tabs_);
 
         auto *details = new QWidget;
@@ -198,6 +311,12 @@ private:
         status_->setContentsMargins(18, 7, 18, 7);
         layout->addWidget(status_);
         setCentralWidget(root);
+        connect(qApp, &QGuiApplication::applicationStateChanged, this, [this](Qt::ApplicationState state) {
+            if (state == Qt::ApplicationActive && !projectDb_.isEmpty()) {
+                refreshWork();
+                refreshHistory();
+            }
+        });
         connect(tree_, &QTreeWidget::itemClicked, this, [this](QTreeWidgetItem *item) {
             const auto facilityId = item->data(0, Qt::UserRole).toString();
             const auto inspectionId = item->data(0, Qt::UserRole + 1).toString();
@@ -269,21 +388,33 @@ private:
         auto *layout = new QVBoxLayout(page);
         layout->setContentsMargins(18, 16, 18, 16);
         layout->addWidget(heading(QStringLiteral("모듈별 작업 현황")));
-        workTable_ = new QTableWidget(std::size(modules), 6);
+        workTable_ = new QTableWidget(std::size(modules), 5);
         workTable_->setHorizontalHeaderLabels({QStringLiteral("모듈"), QStringLiteral("범위"),
-            QStringLiteral("준비"), QStringLiteral("최근 실행"), QStringLiteral("채택 결과"), QStringLiteral("검토")});
+            QStringLiteral("준비"), QStringLiteral("현재 결과"), QStringLiteral("검토")});
         configureTable(workTable_);
         workTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
         layout->addWidget(workTable_, 1);
         connect(workTable_, &QTableWidget::cellClicked, this, [this](int row) {
             if (row < 0 || row >= int(std::size(modules))) return;
             selectionDetail_->setText(QString::fromUtf8(modules[row].name) + QStringLiteral("\n담당 프로그램: ") +
-                QString::fromLatin1(modules[row].program) + QStringLiteral("\n처리 엔진 연결 전: 실행 불가"));
+                QString::fromLatin1(modules[row].program) + QStringLiteral("\n준비: ") +
+                workTable_->item(row, 2)->text() + QStringLiteral("\n현재 결과: ") +
+                workTable_->item(row, 3)->text() + QStringLiteral("\n검토: ") +
+                workTable_->item(row, 4)->text());
+            const bool registration = row == 4 && !pendingReviews_.isEmpty();
+            openCandidate_->setEnabled(registration);
+            confirmCandidate_->setEnabled(registration);
         });
         auto *actions = new QHBoxLayout;
         auto *openProgram = new QPushButton(QStringLiteral("선택 작업의 프로그램 열기"));
+        openCandidate_ = new QPushButton(QStringLiteral("정합 후보 열기"));
+        confirmCandidate_ = new QPushButton(QStringLiteral("검토 확정"));
+        openCandidate_->setEnabled(false);
+        confirmCandidate_->setEnabled(false);
         auto *refresh = new QPushButton(QStringLiteral("현황 새로고침"));
         actions->addWidget(openProgram);
+        actions->addWidget(openCandidate_);
+        actions->addWidget(confirmCandidate_);
         actions->addWidget(refresh);
         actions->addStretch();
         layout->addLayout(actions);
@@ -291,6 +422,33 @@ private:
             const int row = workTable_->currentRow();
             if (row >= 0 && row < int(std::size(modules)) && row != 0)
                 launchProgram(QString::fromLatin1(modules[row].program));
+        });
+        connect(openCandidate_, &QPushButton::clicked, this, [this] {
+            const QString reviewId = choosePendingRegistration();
+            if (!reviewId.isEmpty()) launchProgram(QStringLiteral("RegistrationTool"),
+                {QStringLiteral("--review"), reviewId});
+        });
+        connect(confirmCandidate_, &QPushButton::clicked, this, [this] {
+            const QString reviewId = choosePendingRegistration();
+            if (reviewId.isEmpty()) return;
+            const auto item = std::find_if(pendingReviews_.cbegin(), pendingReviews_.cend(),
+                [&](const RegistrationReviewInfo &candidate) { return candidate.id == reviewId; });
+            if (item == pendingReviews_.cend()) return;
+            if (QMessageBox::question(this, QStringLiteral("정합 결과 확정"),
+                QStringLiteral("%1\n%2\n표면 RMSE %3 m · 0.5 m 이내 %4%\n\n"
+                               "이 후보를 검토하고 확정하시겠습니까? 기존 활성 정합이 교체됩니다.")
+                    .arg(QFileInfo(item->cloudPath).fileName(), item->method)
+                    .arg(item->surfaceRmse, 0, 'f', 3).arg(item->overlap * 100, 0, 'f', 1)) != QMessageBox::Yes)
+                return;
+            QString error;
+            int poses = 0;
+            if (!ProjectStore::confirmRegistration(projectDb_, reviewId, &poses, &error)) {
+                QMessageBox::warning(this, QStringLiteral("정합 확정 실패"), error);
+                return;
+            }
+            refreshWork();
+            refreshHistory();
+            status_->setText(QStringLiteral("정합 결과 확정 · 카메라 pose %1장 갱신").arg(poses));
         });
         connect(refresh, &QPushButton::clicked, this, [this] { refreshWork(); refreshHistory(); });
         return page;
@@ -531,7 +689,20 @@ private:
         tabs_->setCurrentIndex(1);
     }
 
-    void launchProgram(const QString &name) {
+    QString choosePendingRegistration() {
+        if (pendingReviews_.isEmpty()) return {};
+        QStringList labels;
+        for (const auto &item : pendingReviews_)
+            labels.append(QStringLiteral("%1 · %2 · %3 · %4")
+                .arg(QFileInfo(item.cloudPath).fileName(), item.method, item.createdAt, item.id.left(8)));
+        bool accepted = false;
+        const QString choice = QInputDialog::getItem(this, QStringLiteral("미검토 정합 후보"),
+            QStringLiteral("검토할 결과"), labels, 0, false, &accepted);
+        const int index = labels.indexOf(choice);
+        return accepted && index >= 0 ? pendingReviews_[index].id : QString();
+    }
+
+    void launchProgram(const QString &name, const QStringList &extra = {}) {
         if (projectDb_.isEmpty()) return;
         const QString executable = QDir(QCoreApplication::applicationDirPath()).filePath(name + QStringLiteral(".exe"));
         if (!QFileInfo(executable).isFile()) {
@@ -542,32 +713,87 @@ private:
         QStringList arguments{QStringLiteral("--project"), projectDb_};
         if (!selectedFacilityId_.isEmpty()) arguments << QStringLiteral("--facility") << selectedFacilityId_;
         if (!selectedInspectionId_.isEmpty()) arguments << QStringLiteral("--inspection") << selectedInspectionId_;
+        arguments << extra;
         if (!QProcess::startDetached(executable, arguments, QFileInfo(executable).absolutePath()))
             QMessageBox::warning(this, QStringLiteral("프로그램 실행 실패"), executable);
     }
 
     void refreshWork() {
         if (projectDb_.isEmpty()) return;
-        QList<ModuleRunInfo> runs;
         QString error;
-        if (!ProjectStore::runs(projectDb_, selectedInspectionId_, &runs, &error)) {
-            status_->setText(QStringLiteral("실행 이력을 읽지 못했습니다: ") + error);
-            runs.clear();
+        if (!ProjectStore::pendingRegistrations(projectDb_, selectedInspectionId_, &pendingReviews_, &error)) {
+            status_->setText(QStringLiteral("정합 후보를 읽지 못했습니다: ") + error);
+            pendingReviews_.clear();
         }
+        const bool registrationSelected = workTable_->currentRow() == 4 && !pendingReviews_.isEmpty();
+        openCandidate_->setEnabled(registrationSelected);
+        confirmCandidate_->setEnabled(registrationSelected);
+        const WorkCounts counts = readWorkCounts(projectDb_, selectedInspectionId_);
+        datasetsLabel_->setText(counts.datasets > 0 ?
+            QStringLiteral("데이터 세트 %1개 · 이미지 %2장 · 보정 %3장")
+                .arg(counts.datasets).arg(counts.images).arg(counts.corrected) :
+            QStringLiteral("등록된 데이터 세트 없음"));
+        QString modelPath, cloudPath;
+        if (!selectedFacilityId_.isEmpty())
+            ProjectStore::facilityModelPath(projectDb_, selectedFacilityId_, &modelPath, &error);
+        if (!selectedInspectionId_.isEmpty())
+            ProjectStore::inspectionCloudPath(projectDb_, selectedInspectionId_, &cloudPath, &error);
+        const bool hasModel = QFileInfo(modelPath).isDir();
+        const bool hasCloud = QFileInfo(cloudPath).isFile() || counts.clouds > 0;
         for (int row = 0; row < int(std::size(modules)); ++row) {
             const auto &module = modules[row];
-            QString latest = QStringLiteral("—");
-            for (const auto &run : runs) {
-                if (run.moduleId == QString::fromLatin1(module.id)) {
-                    latest = run.status + QStringLiteral(" · ") + run.startedAt;
-                    break;
-                }
-            }
+            QString review = QStringLiteral("—");
             const QString scope = row == 0 ? QStringLiteral("프로젝트") :
                 (selectedInspectionId_.isEmpty() ? QStringLiteral("점검 미선택") : QStringLiteral("선택 점검"));
-            const QStringList cells{QString::fromUtf8(module.name), scope,
-                row == 0 ? QStringLiteral("준비") : QStringLiteral("미구현"), latest,
-                QStringLiteral("—"), QStringLiteral("—")};
+            QString readiness = row == 0 ? QStringLiteral("준비") : QStringLiteral("미구현");
+            QString result = QStringLiteral("—");
+            if (row == 1) {
+                readiness = QStringLiteral("실행 가능");
+                if (counts.datasets > 0)
+                    result = QStringLiteral("데이터 세트 %1개 · 이미지 %2장 · 보정 %3장")
+                        .arg(counts.datasets).arg(counts.images).arg(counts.corrected);
+            } else if (row == 2) {
+                readiness = hasModel ? QStringLiteral("모델 입력 있음") : QStringLiteral("모델 필요");
+                if (hasModel) result = QStringLiteral("모델 경로 등록");
+            } else if (row == 4) {
+                readiness = hasModel && hasCloud ? QStringLiteral("실행 가능") : QStringLiteral("모델·LAS 필요");
+                if (counts.registrations > 0)
+                    result = QStringLiteral("확정 정합 %1건").arg(counts.registrations);
+                review = pendingReviews_.isEmpty() ?
+                    counts.registrations > 0 ? QStringLiteral("확정") : QStringLiteral("—") :
+                    QStringLiteral("미검토 %1건").arg(pendingReviews_.size());
+            } else if (row == 5) {
+                readiness = counts.registrations > 0 ? QStringLiteral("정합 결과 있음") : QStringLiteral("정합 필요");
+                if (counts.alignedPoses > 0)
+                    result = QStringLiteral("모델 좌표 pose %1장").arg(counts.alignedPoses);
+                if (counts.alignedPoses > 0) review = QStringLiteral("확정");
+            } else if (row == 7) {
+                readiness = counts.images > 0 ? QStringLiteral("실행 가능") : QStringLiteral("영상 필요");
+                if (counts.damageImages > 0)
+                    result = QStringLiteral("결과 %1장 · 손상 %2개")
+                        .arg(counts.damageImages).arg(counts.damageObjects);
+                if (counts.damagePending > 0) review = QStringLiteral("검토 필요 %1개").arg(counts.damagePending);
+                else if (counts.damageImages > 0) review = QStringLiteral("검토 완료");
+            } else if (row == 8) {
+                readiness = counts.alignedPoses > 0 && counts.damageObjects > 0 ?
+                    QStringLiteral("실행 가능") : QStringLiteral("pose·채택 손상 필요");
+                if (counts.mapRuns > 0)
+                    result = QStringLiteral("투영 %1건 · 확인 필요 %2건")
+                        .arg(counts.projectedDamages).arg(counts.projectionPending);
+                if (counts.projectionPending > 0)
+                    review = QStringLiteral("확인 필요 %1건").arg(counts.projectionPending);
+            } else if (row == 9) {
+                readiness = counts.mapRuns > 0 ? QStringLiteral("계산 결과 있음") : QStringLiteral("투영 필요");
+                if (counts.mapRuns > 0)
+                    result = QStringLiteral("3D 물량 %1건 · 초안").arg(counts.measuredDamages);
+            } else if (row == 10) {
+                readiness = counts.mapRuns > 0 ? QStringLiteral("도면 초안 가능") : QStringLiteral("투영 필요");
+                if (counts.mapRuns > 0)
+                    result = QStringLiteral("부재 %1개 · 망도/HTML/PDF/Excel 출력 가능").arg(counts.mapParts);
+                if (counts.projectionPending > 0)
+                    review = QStringLiteral("확인 필요 %1건").arg(counts.projectionPending);
+            }
+            const QStringList cells{QString::fromUtf8(module.name), scope, readiness, result, review};
             for (int col = 0; col < cells.size(); ++col)
                 workTable_->setItem(row, col, new QTableWidgetItem(cells[col]));
         }
@@ -592,14 +818,18 @@ private:
 
     void refreshHistory() {
         if (projectDb_.isEmpty()) return;
-        QList<ModuleRunInfo> runs;
+        QList<ModuleRunInfo> allRuns;
         QList<ArtifactInfo> artifacts;
         QString error;
-        if (!ProjectStore::runs(projectDb_, selectedInspectionId_, &runs, &error) ||
+        if (!ProjectStore::runs(projectDb_, {}, &allRuns, &error) ||
             !ProjectStore::artifacts(projectDb_, &artifacts, &error)) {
             status_->setText(QStringLiteral("산출물·이력 조회 실패: ") + error);
             return;
         }
+        QList<ModuleRunInfo> runs;
+        for (const auto &run : allRuns)
+            if (selectedInspectionId_.isEmpty() || run.inspectionId == selectedInspectionId_ || run.inspectionId.isEmpty())
+                runs.append(run);
         runTable_->setRowCount(runs.size());
         for (int row = 0; row < runs.size(); ++row) {
             const QStringList cells{runs[row].moduleId, runs[row].status, runs[row].startedAt, runs[row].finishedAt};
@@ -662,6 +892,10 @@ private:
             inspectionTable_->setItem(i, 0, new QTableWidgetItem(item.name));
             inspectionTable_->setItem(i, 1, new QTableWidgetItem(item.type));
             inspectionTable_->setItem(i, 2, new QTableWidgetItem(item.startedAt + QStringLiteral(" ~ ") + item.endedAt));
+        }
+        if (inspections_.size() == 1) {
+            selectedInspectionId_ = inspections_.first().id;
+            inspectionTable_->selectRow(0);
         }
         updateScope();
         refreshTree();
@@ -843,6 +1077,7 @@ private:
     QLabel *projectId_ = nullptr;
     QLabel *projectPath_ = nullptr;
     QLabel *inputDetail_ = nullptr;
+    QLabel *datasetsLabel_ = nullptr;
     QTreeWidget *tree_ = nullptr;
     QTabWidget *tabs_ = nullptr;
     QTableWidget *recent_ = nullptr;
@@ -850,6 +1085,8 @@ private:
     QTableWidget *inspectionTable_ = nullptr;
     QList<QPushButton *> programButtons_;
     QTableWidget *workTable_ = nullptr;
+    QPushButton *openCandidate_ = nullptr, *confirmCandidate_ = nullptr;
+    QList<RegistrationReviewInfo> pendingReviews_;
     QTableWidget *pipelineTable_ = nullptr;
     QTableWidget *runTable_ = nullptr;
     QTableWidget *artifactTable_ = nullptr;

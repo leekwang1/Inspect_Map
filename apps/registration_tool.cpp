@@ -1,14 +1,17 @@
 #include "lidar_preview.h"
 #include "registration_engine.h"
 #include "project_store.h"
+#include "conversion_core.h"
 
 #include <QApplication>
+#include <QButtonGroup>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDateTime>
 #include <QDir>
 #include <QDirIterator>
 #include <QFileDialog>
+#include <QFile>
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QGridLayout>
@@ -24,6 +27,7 @@
 #include <QMainWindow>
 #include <QMessageBox>
 #include <QMouseEvent>
+#include <QPointF>
 #include <QPushButton>
 #include <QRect>
 #include <QRubberBand>
@@ -33,9 +37,11 @@
 #include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
+#include <QSignalBlocker>
 #include <QSplitter>
 #include <QTabWidget>
 #include <QTableWidget>
+#include <QToolButton>
 #include <QTimer>
 #include <QUuid>
 #include <QVBoxLayout>
@@ -46,6 +52,7 @@
 #include <vtkAppendPolyData.h>
 #include <vtkBillboardTextActor3D.h>
 #include <vtkCamera.h>
+#include <vtkCellArray.h>
 #include <vtkCellPicker.h>
 #include <vtkGenericOpenGLRenderWindow.h>
 #include <vtkLookupTable.h>
@@ -66,6 +73,111 @@
 
 namespace {
 QString id() { return QUuid::createUuid().toString(QUuid::WithoutBraces); }
+
+struct CameraPreviewItem {
+    QString name;
+    PreviewCamera pose;
+    int width = 0;
+    int height = 0;
+};
+
+struct PreviewIntrinsics {
+    double fx = 0, fy = 0, cx = 0, cy = 0;
+    int width = 0, height = 0;
+    bool valid = false;
+};
+
+PreviewIntrinsics readPreviewIntrinsics(const QString &path) {
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) return {};
+    const auto object = QJsonDocument::fromJson(file.readAll()).object();
+    const auto rows = object.value(QStringLiteral("P")).toArray();
+    const auto size = object.value(QStringLiteral("image_size")).toObject();
+    if (rows.size() < 2 || rows[0].toArray().size() < 3 || rows[1].toArray().size() < 3) return {};
+    PreviewIntrinsics result;
+    result.fx = rows[0].toArray()[0].toDouble();
+    result.fy = rows[1].toArray()[1].toDouble();
+    result.cx = rows[0].toArray()[2].toDouble();
+    result.cy = rows[1].toArray()[2].toDouble();
+    result.width = size.value(QStringLiteral("width")).toInt();
+    result.height = size.value(QStringLiteral("height")).toInt();
+    result.valid = result.fx > 0 && result.fy > 0 && result.width > 0 && result.height > 0;
+    return result;
+}
+
+vtkSmartPointer<vtkActor> cameraCentersActor(const QVector<QVector3D> &positions) {
+    vtkNew<vtkPoints> points;
+    vtkNew<vtkCellArray> vertices;
+    for (const auto &position : positions) {
+        const vtkIdType index = points->InsertNextPoint(position.x(), position.y(), position.z());
+        vertices->InsertNextCell(1);
+        vertices->InsertCellPoint(index);
+    }
+    vtkNew<vtkPolyData> geometry;
+    geometry->SetPoints(points);
+    geometry->SetVerts(vertices);
+    vtkNew<vtkPolyDataMapper> mapper;
+    mapper->SetInputData(geometry);
+    auto actor = vtkSmartPointer<vtkActor>::New();
+    actor->SetMapper(mapper);
+    actor->GetProperty()->SetColor(0.95, 0.29, 0.23);
+    actor->GetProperty()->SetPointSize(7.0);
+    actor->GetProperty()->LightingOff();
+    actor->PickableOff();
+    return actor;
+}
+
+vtkSmartPointer<vtkActor> cameraFrustumActor(const QVector3D &origin, const QQuaternion &orientation,
+                                            const PreviewIntrinsics &intrinsics, int width, int height,
+                                            double length) {
+    const QVector3D forward = orientation.rotatedVector(QVector3D(1, 0, 0));
+    const QVector3D right = orientation.rotatedVector(QVector3D(0, 1, 0));
+    const QVector3D up = orientation.rotatedVector(QVector3D(0, 0, 1));
+    QVector<QVector3D> corners;
+    if (intrinsics.valid && width > 0 && height > 0) {
+        const double scaleX = double(width) / intrinsics.width;
+        const double scaleY = double(height) / intrinsics.height;
+        const double fx = intrinsics.fx * scaleX, fy = intrinsics.fy * scaleY;
+        const double cx = intrinsics.cx * scaleX, cy = intrinsics.cy * scaleY;
+        for (const auto &pixel : {QPointF(0, 0), QPointF(width, 0),
+                                  QPointF(width, height), QPointF(0, height)}) {
+            corners.append(origin + forward * float(length) +
+                right * float((pixel.x() - cx) / fx * length) -
+                up * float((pixel.y() - cy) / fy * length));
+        }
+    } else {
+        const float halfWidth = float(length * 0.65), halfHeight = halfWidth * 0.75f;
+        const QVector3D target = origin + forward * float(length);
+        corners = {target - right * halfWidth + up * halfHeight,
+                   target + right * halfWidth + up * halfHeight,
+                   target + right * halfWidth - up * halfHeight,
+                   target - right * halfWidth - up * halfHeight};
+    }
+    vtkNew<vtkPoints> points;
+    points->InsertNextPoint(origin.x(), origin.y(), origin.z());
+    for (const auto &point : corners) points->InsertNextPoint(point.x(), point.y(), point.z());
+    vtkNew<vtkCellArray> lines;
+    for (vtkIdType i = 1; i <= 4; ++i) {
+        lines->InsertNextCell(2);
+        lines->InsertCellPoint(0);
+        lines->InsertCellPoint(i);
+        lines->InsertNextCell(2);
+        lines->InsertCellPoint(i);
+        lines->InsertCellPoint(i % 4 + 1);
+    }
+    vtkNew<vtkPolyData> geometry;
+    geometry->SetPoints(points);
+    geometry->SetLines(lines);
+    vtkNew<vtkPolyDataMapper> mapper;
+    mapper->SetInputData(geometry);
+    auto actor = vtkSmartPointer<vtkActor>::New();
+    actor->SetMapper(mapper);
+    actor->GetProperty()->SetColor(1.0, 0.74, 0.22);
+    actor->GetProperty()->SetLineWidth(2.0);
+    actor->GetProperty()->LightingOff();
+    actor->PickableOff();
+    return actor;
+}
 
 vtkSmartPointer<vtkActor> modelActor(vtkPolyData *geometry, double opacity) {
     vtkNew<vtkPolyDataMapper> mapper;
@@ -337,7 +449,7 @@ QString pointText(const QVector3D &point) {
 class RegistrationWindow : public QMainWindow {
 public:
     explicit RegistrationWindow(const QString &project, const QString &facility, const QString &inspection,
-                                const QString &modelPath, const QString &cloudPath)
+                                const QString &modelPath, const QString &cloudPath, const QString &reviewId)
         : projectDb_(project), facilityId_(facility), inspectionId_(inspection) {
         setWindowTitle(QStringLiteral("InspectMap | 정합 작업기"));
         resize(1540, 900);
@@ -370,6 +482,11 @@ public:
         modelInfo_->setWordWrap(true);
         form->addWidget(modelInfo_);
         form->addWidget(heading(QStringLiteral("정합 대상 부재")));
+        sideMode_ = new QComboBox;
+        sideMode_->addItem(QStringLiteral("조사 모드 선택"), 0);
+        sideMode_->addItem(QStringLiteral("외관 조사 · EX 면"), 1);
+        sideMode_->addItem(QStringLiteral("내부 조사 · IN 면"), 2);
+        form->addWidget(sideMode_);
         partList_ = new QListWidget;
         partList_->setMaximumHeight(150);
         form->addWidget(partList_);
@@ -386,13 +503,51 @@ public:
         cloudInfo_->setWordWrap(true);
         form->addWidget(cloudInfo_);
         form->addSpacing(12);
-        form->addWidget(heading(QStringLiteral("수동 대응점")));
+        form->addWidget(heading(QStringLiteral("자동정합")));
+        auto *icpModes = new QHBoxLayout;
+        icpModes->addWidget(new QLabel(QStringLiteral("ICP 변환")));
+        auto *icpModeGroup = new QButtonGroup(this);
+        icpModeGroup->setExclusive(true);
+        auto *icpRigid = new QPushButton(QStringLiteral("RigidBody"));
+        icpSimilarity_ = new QPushButton(QStringLiteral("Similarity"));
+        icpRigid->setToolTip(QStringLiteral("회전과 이동만 추정하며 스케일을 고정합니다."));
+        icpSimilarity_->setToolTip(QStringLiteral("회전·이동과 균일 스케일을 함께 추정합니다."));
+        for (auto *button : {icpRigid, icpSimilarity_}) {
+            button->setCheckable(true);
+            button->setStyleSheet(QStringLiteral("QPushButton {padding:6px;border:1px solid #b9cbd1;} "
+                "QPushButton:checked {background:#0f766e;color:white;border-color:#0f766e;}"));
+            icpModeGroup->addButton(button);
+            icpModes->addWidget(button, 1);
+        }
+        icpRigid->setChecked(true);
+        form->addLayout(icpModes);
+        auto *automatic = new QPushButton(QStringLiteral("ICP 자동·정밀 정합"));
+        automatic->setToolTip(QStringLiteral("매번 원본 점군 또는 마지막 수동 대응점 정합 결과에서 시작합니다."));
+        form->addWidget(automatic);
+        metrics_ = new QLabel(QStringLiteral("정합 결과 없음"));
+        metrics_->setWordWrap(true);
+        form->addWidget(metrics_);
+        auto *manualToggle = new QToolButton;
+        manualToggle->setText(QStringLiteral("수동정합"));
+        manualToggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        manualToggle->setArrowType(Qt::RightArrow);
+        manualToggle->setCheckable(true);
+        manualToggle->setStyleSheet(QStringLiteral("QToolButton {font-size:16px;font-weight:bold;color:#233f50;border:0;padding:6px 0;}"));
+        form->addWidget(manualToggle);
+        auto *manualPanel = new QWidget;
+        auto *manualLayout = new QVBoxLayout(manualPanel);
+        manualLayout->setContentsMargins(0, 0, 0, 0);
+        manualPanel->setVisible(false);
+        connect(manualToggle, &QToolButton::toggled, manualPanel, [manualToggle, manualPanel](bool open) {
+            manualToggle->setArrowType(open ? Qt::DownArrow : Qt::RightArrow);
+            manualPanel->setVisible(open);
+        });
         auto *pickActions = new QHBoxLayout;
         auto *pickSource = new QPushButton(QStringLiteral("점군 점 선택"));
         auto *pickTarget = new QPushButton(QStringLiteral("모델 점 선택"));
         pickActions->addWidget(pickSource);
         pickActions->addWidget(pickTarget);
-        form->addLayout(pickActions);
+        manualLayout->addLayout(pickActions);
         pairs_ = new QTableWidget(0, 3);
         pairs_->setHorizontalHeaderLabels({QStringLiteral("#"), QStringLiteral("LAS (m)"), QStringLiteral("모델 (m)")});
         pairs_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
@@ -400,7 +555,8 @@ public:
         pairs_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
         pairs_->verticalHeader()->hide();
         pairs_->setSelectionBehavior(QAbstractItemView::SelectRows);
-        form->addWidget(pairs_, 1);
+        pairs_->setMinimumHeight(180);
+        manualLayout->addWidget(pairs_);
         auto *editActions = new QHBoxLayout;
         auto *removePair = new QPushButton(QStringLiteral("선택 쌍 삭제"));
         auto *undoPair = new QPushButton(QStringLiteral("마지막 쌍 취소"));
@@ -408,17 +564,27 @@ public:
         editActions->addWidget(removePair);
         editActions->addWidget(undoPair);
         editActions->addWidget(clearPairs);
-        form->addLayout(editActions);
+        manualLayout->addLayout(editActions);
         allowScale_ = new QCheckBox(QStringLiteral("스케일 추정 (SfM 점군)"));
-        form->addWidget(allowScale_);
+        manualLayout->addWidget(allowScale_);
         auto *manual = new QPushButton(QStringLiteral("대응점 정합"));
-        auto *automatic = new QPushButton(QStringLiteral("ICP 자동·정밀 정합"));
-        form->addWidget(manual);
-        form->addWidget(automatic);
-        metrics_ = new QLabel(QStringLiteral("정합 결과 없음"));
-        metrics_->setWordWrap(true);
-        form->addWidget(metrics_);
-        form->addWidget(heading(QStringLiteral("결과 미세 조정")));
+        manualLayout->addWidget(manual);
+        form->addWidget(manualPanel);
+        auto *adjustToggle = new QToolButton;
+        adjustToggle->setText(QStringLiteral("결과 미세 조정"));
+        adjustToggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        adjustToggle->setArrowType(Qt::RightArrow);
+        adjustToggle->setCheckable(true);
+        adjustToggle->setStyleSheet(QStringLiteral("QToolButton {font-size:16px;font-weight:bold;color:#233f50;border:0;padding:6px 0;}"));
+        form->addWidget(adjustToggle);
+        auto *adjustPanel = new QWidget;
+        auto *adjustLayout = new QVBoxLayout(adjustPanel);
+        adjustLayout->setContentsMargins(0, 0, 0, 0);
+        adjustPanel->setVisible(false);
+        connect(adjustToggle, &QToolButton::toggled, adjustPanel, [adjustToggle, adjustPanel](bool open) {
+            adjustToggle->setArrowType(open ? Qt::DownArrow : Qt::RightArrow);
+            adjustPanel->setVisible(open);
+        });
         auto *adjustGrid = new QGridLayout;
         const QStringList axes{QStringLiteral("X"), QStringLiteral("Y"), QStringLiteral("Z"),
                                QStringLiteral("Rx"), QStringLiteral("Ry"), QStringLiteral("Rz")};
@@ -432,19 +598,25 @@ public:
             adjustGrid->addWidget(new QLabel(axes[i]), i / 3, (i % 3) * 2);
             adjustGrid->addWidget(value, i / 3, (i % 3) * 2 + 1);
         }
-        form->addLayout(adjustGrid);
+        adjustLayout->addLayout(adjustGrid);
         auto *adjustActions = new QHBoxLayout;
         auto *applyAdjust = new QPushButton(QStringLiteral("조정 적용"));
         auto *undoAdjust = new QPushButton(QStringLiteral("조정 취소"));
         adjustActions->addWidget(applyAdjust);
         adjustActions->addWidget(undoAdjust);
-        form->addLayout(adjustActions);
-        poseSameFrame_ = new QCheckBox(QStringLiteral("카메라 pose와 LAS가 동일 좌표계임을 확인"));
+        adjustLayout->addLayout(adjustActions);
+        form->addWidget(adjustPanel);
+        poseSameFrame_ = new QCheckBox(QStringLiteral("확정 시 카메라 위치·자세에도 정합 결과 적용"));
+        poseSameFrame_->setToolTip(QStringLiteral("카메라 초기 pose와 LAS가 동일한 원본 좌표계일 때만 선택하십시오."));
+        poseSameFrame_->setEnabled(false);
         form->addWidget(poseSameFrame_);
-        save_ = new QPushButton(QStringLiteral("정합 결과 채택·저장"));
+        save_ = new QPushButton(QStringLiteral("정합 후보 저장"));
         save_->setEnabled(false);
         save_->setStyleSheet(QStringLiteral("background:#0f766e;color:white;padding:9px;"));
         form->addWidget(save_);
+        confirm_ = new QPushButton(QStringLiteral("검토 확정"));
+        confirm_->setEnabled(false);
+        form->addWidget(confirm_);
         auto *controlScroll = new QScrollArea;
         controlScroll->setWidgetResizable(true);
         controlScroll->setFrameShape(QFrame::NoFrame);
@@ -471,6 +643,7 @@ public:
         modelMode_ = new QComboBox;
         modelMode_->addItems({QStringLiteral("선택 부재"), QStringLiteral("전체 참조"),
                               QStringLiteral("선택 와이어")});
+        modelMode_->setCurrentIndex(1);
         auto *fitPart = new QPushButton(QStringLiteral("선택에 맞춤"));
         auto *pivotPart = new QPushButton(QStringLiteral("회전 중심"));
         targetTools->addWidget(modelMode_);
@@ -489,8 +662,51 @@ public:
         pairLayout->addLayout(sourceColumn, 1);
         pairLayout->addLayout(targetColumn, 1);
         views_->addTab(pairPage, QStringLiteral("대응점"));
+        auto *resultPage = new QWidget;
+        auto *resultLayout = new QVBoxLayout(resultPage);
+        auto *cameraBar = new QHBoxLayout;
+        cameraBar->addWidget(new QLabel(QStringLiteral("미리보기 좌표계")));
+        auto *previewModes = new QButtonGroup(this);
+        previewModes->setExclusive(true);
+        previewOriginal_ = new QPushButton(QStringLiteral("원본 · LAS"));
+        previewAligned_ = new QPushButton(QStringLiteral("정합 후 · 모델"));
+        for (auto *button : {previewOriginal_, previewAligned_}) {
+            button->setCheckable(true);
+            button->setStyleSheet(QStringLiteral("QPushButton {padding:5px 10px;border:1px solid #b9cbd1;} "
+                "QPushButton:checked {background:#0f766e;color:white;border-color:#0f766e;}"));
+            previewModes->addButton(button);
+            cameraBar->addWidget(button);
+        }
+        previewAligned_->setChecked(true);
+        showPreviewCloud_ = new QCheckBox(QStringLiteral("점군"));
+        showPreviewCloud_->setChecked(true);
+        showCameraCenters_ = new QCheckBox(QStringLiteral("촬영 위치"));
+        showCameraCenters_->setChecked(true);
+        showSelectedFrustum_ = new QCheckBox(QStringLiteral("프러스텀"));
+        showSelectedFrustum_->setChecked(true);
+        previewCamera_ = new QComboBox;
+        previewCamera_->setMinimumWidth(220);
+        cameraStatus_ = new QLabel(QStringLiteral("연결된 카메라 pose 없음"));
+        showCameraCenters_->setEnabled(false);
+        showSelectedFrustum_->setEnabled(false);
+        previewCamera_->setEnabled(false);
+        cameraBar->addWidget(showPreviewCloud_);
+        cameraBar->addWidget(showCameraCenters_);
+        cameraBar->addWidget(showSelectedFrustum_);
+        cameraBar->addWidget(previewCamera_);
+        cameraBar->addWidget(cameraStatus_, 1);
+        resultLayout->addLayout(cameraBar);
+        auto *modelBar = new QHBoxLayout;
+        modelBar->addWidget(new QLabel(QStringLiteral("모델 표시")));
+        previewModelMode_ = new QComboBox;
+        previewModelMode_->addItems({QStringLiteral("표면"), QStringLiteral("와이어프레임")});
+        previewModelMode_->setToolTip(QStringLiteral("정합 후 미리보기의 전체 모델과 선택 부재 표시 방식"));
+        modelBar->addWidget(previewModelMode_);
+        modelBar->addStretch(1);
+        resultLayout->addLayout(modelBar);
         resultView_ = new PickView(false);
-        views_->addTab(resultView_, QStringLiteral("정합 미리보기"));
+        resultLayout->addWidget(resultView_, 1);
+        views_->addTab(resultPage, QStringLiteral("정합 미리보기"));
         split->addWidget(views_);
         split->setSizes({440, 1100});
         layout->addWidget(split, 1);
@@ -498,6 +714,20 @@ public:
         status_->setStyleSheet(QStringLiteral("background:#eef3f5;color:#355466;padding:8px 16px;"));
         layout->addWidget(status_);
         setCentralWidget(root);
+
+        connect(previewOriginal_, &QPushButton::clicked, this, [this] {
+            previewModelMode_->setEnabled(false);
+            updateOverlay();
+        });
+        connect(previewAligned_, &QPushButton::clicked, this, [this] {
+            previewModelMode_->setEnabled(true);
+            updateOverlay();
+        });
+        connect(previewModelMode_, &QComboBox::currentIndexChanged, this, [this] { updateOverlay(false); });
+        connect(showPreviewCloud_, &QCheckBox::toggled, this, [this] { updateOverlay(false); });
+        connect(showCameraCenters_, &QCheckBox::toggled, this, [this] { updateOverlay(false); });
+        connect(showSelectedFrustum_, &QCheckBox::toggled, this, [this] { updateOverlay(false); });
+        connect(previewCamera_, &QComboBox::currentIndexChanged, this, [this] { updateOverlay(false); });
 
         connect(chooseModel, &QPushButton::clicked, this, [this] {
             const auto path = QFileDialog::getExistingDirectory(this, QStringLiteral("모델 폴더"));
@@ -514,6 +744,12 @@ public:
             if (index > 0) loadCloud(cloudList_->itemData(index).toString());
         });
         connect(partList_, &QListWidget::itemChanged, this, [this] { updateSelectedParts(); });
+        connect(sideMode_, &QComboBox::currentIndexChanged, this, [this] {
+            sourcePairs_.clear(); targetPairs_.clear();
+            pendingSource_.reset(); pendingTarget_.reset();
+            refreshPairs();
+            updateSelectedParts();
+        });
         connect(modelMode_, &QComboBox::currentIndexChanged, this, [this] { updateModelView(); });
         connect(fitPart, &QPushButton::clicked, this, [this] {
             targetView_->fitGeometry(selectedModel_ ? selectedModel_.GetPointer() : model_.GetPointer());
@@ -575,12 +811,26 @@ public:
         connect(applyAdjust, &QPushButton::clicked, this, [this] { applyAdjustment(); });
         connect(undoAdjust, &QPushButton::clicked, this, [this] { undoAdjustment(); });
         connect(save_, &QPushButton::clicked, this, [this] { saveResult(); });
+        connect(confirm_, &QPushButton::clicked, this, [this] { confirmSavedResult(); });
 
         QString selectedModel = modelPath;
         QString selectedCloud = cloudPath;
+        RegistrationReviewInfo savedReview;
         if (!projectDb_.isEmpty()) {
             QString error;
             ProjectStore::ensureManagerSchema(projectDb_, &error);
+            if (!reviewId.isEmpty()) {
+                QList<RegistrationReviewInfo> reviews;
+                if (ProjectStore::pendingRegistrations(projectDb_, {}, &reviews, &error)) {
+                    for (const auto &item : reviews)
+                        if (item.id == reviewId) { savedReview = item; break; }
+                    if (!savedReview.id.isEmpty()) {
+                        selectedModel = savedReview.modelRoot;
+                        selectedCloud = savedReview.cloudPath;
+                        if (!savedReview.inspectionId.isEmpty()) inspectionId_ = savedReview.inspectionId;
+                    } else status_->setText(QStringLiteral("미검토 정합 후보를 찾지 못했습니다."));
+                } else status_->setText(QStringLiteral("정합 후보 조회 실패: ") + error);
+            }
             if (facilityId_.isEmpty() && !inspectionId_.isEmpty()) {
                 const QString connection = id();
                 {
@@ -634,6 +884,7 @@ public:
                     cloudList_->setCurrentIndex(row); break;
                 }
         }
+        if (!savedReview.id.isEmpty()) showSavedReview(savedReview);
     }
 
 private:
@@ -653,7 +904,7 @@ private:
                 QSqlQuery query(db);
                 query.prepare(QStringLiteral("SELECT c.point_cloud_id,c.dataset_id,c.source_path,c.source_scope "
                     "FROM point_cloud c JOIN dataset d ON d.dataset_id=c.dataset_id "
-                    "WHERE (?='' OR d.inspection_id=?) "
+                    "WHERE (?='' OR d.inspection_id=? OR d.inspection_id IS NULL) "
                     "ORDER BY CASE c.source_scope WHEN 'Inspection' THEN 0 "
                     "WHEN 'Flight' THEN 1 ELSE 2 END,c.source_path"));
                 query.addBindValue(inspectionId_);
@@ -710,22 +961,34 @@ private:
         const int drawings = QDir(package).exists(QStringLiteral("map")) ?
             QDirIterator(QDir(package).filePath(QStringLiteral("map")), {QStringLiteral("*.dxf")},
                          QDir::Files, QDirIterator::Subdirectories).hasNext() : 0;
-        modelInfo_->setText(QStringLiteral("부재 %1개 · 삼각형 %2개 · map %3")
+        int exteriorParts = 0, interiorParts = 0;
+        for (const auto &part : parts_) {
+            if (part.exteriorFaces) ++exteriorParts;
+            if (part.interiorFaces) ++interiorParts;
+        }
+        modelInfo_->setText(QStringLiteral("부재 %1개 · 삼각형 %2개 · EX %3개 · IN %4개 · map %5")
             .arg(parts_.size()).arg(model_->GetNumberOfPolys())
+            .arg(exteriorParts).arg(interiorParts)
             .arg(drawings ? QStringLiteral("있음") : QStringLiteral("없음")));
         sourcePairs_.clear(); targetPairs_.clear(); refreshPairs();
         updateSelectedParts();
+        loadConfirmedPreview();
         status_->setText(QStringLiteral("기준 모델을 불러왔습니다."));
     }
 
     void updateSelectedParts() {
         vtkNew<vtkAppendPolyData> append;
-        int count = 0;
+        int count = 0, missing = 0;
         for (int i = 0; i < partList_->count(); ++i) {
             if (partList_->item(i)->checkState() != Qt::Checked) continue;
-            append->AddInputData(parts_[i].geometry);
+            const int side = sideMode_->currentData().toInt();
+            auto geometry = side == 1 ? parts_[i].exteriorFaces :
+                side == 2 ? parts_[i].interiorFaces : parts_[i].geometry;
+            if (!geometry) { ++missing; continue; }
+            append->AddInputData(geometry);
             ++count;
         }
+        missingSideParts_ = missing;
         selectedModel_ = nullptr;
         if (count) {
             append->Update();
@@ -736,8 +999,10 @@ private:
                                      float((bounds[2] + bounds[3]) * 0.5),
                                      float((bounds[4] + bounds[5]) * 0.5));
         }
-        selectedInfo_->setText(QStringLiteral("선택 %1 / %2개 · 모델 점 선택은 선택 부재만")
-            .arg(count).arg(parts_.size()));
+        selectedInfo_->setText(QStringLiteral("사용 가능 %1 / %2개 · %3")
+            .arg(count).arg(parts_.size()).arg(missing ?
+                QStringLiteral("%1개 부재에 해당 면 정보 없음").arg(missing) :
+                QStringLiteral("모델 점 선택은 표시된 면만")));
         if (selectedActor_) targetView_->renderer()->RemoveActor(selectedActor_);
         selectedActor_ = nullptr;
         if (selectedModel_) {
@@ -750,7 +1015,7 @@ private:
         targetView_->setPickActor(selectedActor_);
         updateModelView();
         invalidateResult();
-        updateOverlay();
+        updateOverlay(false);
     }
 
     void updateModelView() {
@@ -794,15 +1059,97 @@ private:
         sourceView_->setPickActor(sourceActor_);
         sourceView_->fit();
         showCloudInfo();
+        resolveCloudDataset();
+        reloadCameraPreview();
         sourcePairs_.clear(); targetPairs_.clear(); refreshPairs();
         invalidateResult(); updateOverlay();
-        status_->setText(QStringLiteral("LAS를 불러왔습니다. 대응점 또는 ICP로 정합하십시오."));
+        loadConfirmedPreview();
+        if (!savedMatrix_) status_->setText(QStringLiteral("LAS를 불러왔습니다. 대응점 또는 ICP로 정합하십시오."));
     }
 
     void showCloudInfo() {
         cloudInfo_->setText(QStringLiteral("%1\n전체 %2점 · 미리보기 %3점 · 작업 영역 %4점")
             .arg(cloudPath_).arg(cloud_.totalPoints).arg(cloud_.points.size())
             .arg(activeCloud_.points.size()));
+    }
+
+    void resolveCloudDataset() {
+        const int row = cloudList_->currentIndex();
+        if (projectDb_.isEmpty() || row < 1 ||
+            !cloudList_->itemData(row, Qt::UserRole + 2).toString().isEmpty()) return;
+        const QString selectedPath = QDir::cleanPath(QFileInfo(cloudPath_).absoluteFilePath());
+        const QString connection = id();
+        {
+            auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
+            db.setDatabaseName(projectDb_);
+            if (db.open()) {
+                QSqlQuery query(db);
+                if (query.exec(QStringLiteral("SELECT point_cloud_id,dataset_id,source_path FROM point_cloud"))) {
+                    while (query.next()) {
+                        const QString registeredPath = QDir::cleanPath(QFileInfo(query.value(2).toString()).absoluteFilePath());
+                        if (selectedPath.compare(registeredPath, Qt::CaseInsensitive) != 0) continue;
+                        cloudList_->setItemData(row, query.value(0), Qt::UserRole + 1);
+                        cloudList_->setItemData(row, query.value(1), Qt::UserRole + 2);
+                        break;
+                    }
+                }
+            }
+            db.close();
+        }
+        QSqlDatabase::removeDatabase(connection);
+    }
+
+    void reloadCameraPreview() {
+        cameras_.clear();
+        previewIntrinsics_ = {};
+        {
+            const QSignalBlocker blocker(previewCamera_);
+            previewCamera_->clear();
+        }
+        const QString datasetId = cloudList_->currentData(Qt::UserRole + 2).toString();
+        if (!projectDb_.isEmpty() && !datasetId.isEmpty()) {
+            const QString connection = id();
+            {
+                auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
+                db.setDatabaseName(projectDb_);
+                if (db.open()) {
+                    QSqlQuery query(db);
+                    query.prepare(QStringLiteral("SELECT COALESCE(NULLIF(i.display_name,''),i.source_identifier),"
+                        "i.width,i.height,p.pose_json FROM image i JOIN camera_pose p ON p.image_id=i.image_id "
+                        "WHERE i.dataset_id=? AND p.pose_stage='INITIAL' "
+                        "ORDER BY i.capture_time,i.display_name,i.image_id"));
+                    query.addBindValue(datasetId);
+                    if (query.exec()) while (query.next()) {
+                        CameraPreviewItem item;
+                        item.name = query.value(0).toString();
+                        item.width = query.value(1).toInt();
+                        item.height = query.value(2).toInt();
+                        item.pose = parsePreviewCamera(query.value(3).toString());
+                        if (item.pose.valid) cameras_.append(item);
+                    }
+                    db.close();
+                }
+            }
+            QSqlDatabase::removeDatabase(connection);
+            QString profilePath, error;
+            if (ConversionCore::activeProfile(projectDb_, datasetId, &profilePath, &error))
+                previewIntrinsics_ = readPreviewIntrinsics(profilePath);
+        }
+        {
+            const QSignalBlocker blocker(previewCamera_);
+            for (const auto &item : cameras_) previewCamera_->addItem(item.name);
+        }
+        const bool hasCameras = !cameras_.isEmpty();
+        previewCamera_->setEnabled(hasCameras);
+        showCameraCenters_->setEnabled(hasCameras);
+        showSelectedFrustum_->setEnabled(hasCameras);
+        poseSameFrame_->setEnabled(hasCameras);
+        poseSameFrame_->setChecked(hasCameras);
+        cameraStatus_->setText(hasCameras ?
+            QStringLiteral("초기 pose %1개 · 프러스텀 %2 · 저장 전 미리보기")
+                .arg(cameras_.size()).arg(previewIntrinsics_.valid ? QStringLiteral("보정값 적용") : QStringLiteral("근사")) :
+            datasetId.isEmpty() ? QStringLiteral("LAS가 이미지 데이터 세트에 연결되지 않음") :
+                QStringLiteral("연결된 데이터 세트에 초기 pose 없음"));
     }
 
     void useCloudSelection(CloudPreview selected) {
@@ -913,30 +1260,145 @@ private:
 
     void invalidateResult() {
         matrix_ = nullptr;
+        icpStart_ = nullptr;
         previousMatrix_ = nullptr;
         method_.clear();
-        metrics_->setText(QStringLiteral("정합 결과 없음"));
+        if (!savedMatrix_ || reviewId_.isEmpty()) reviewId_.clear();
+        if (!savedMatrix_) metrics_->setText(QStringLiteral("정합 결과 없음"));
         save_->setEnabled(false);
+        confirm_->setEnabled(!reviewId_.isEmpty());
+        updateOverlay(false);
     }
 
-    void updateOverlay() {
+    static vtkSmartPointer<vtkMatrix4x4> matrixFromJson(const QString &json) {
+        const auto rows = QJsonDocument::fromJson(json.toUtf8()).array();
+        if (rows.size() != 4) return nullptr;
+        auto matrix = vtkSmartPointer<vtkMatrix4x4>::New();
+        for (int row = 0; row < 4; ++row) {
+            const auto columns = rows[row].toArray();
+            if (columns.size() != 4) return nullptr;
+            for (int column = 0; column < 4; ++column)
+                matrix->SetElement(row, column, columns[column].toDouble());
+        }
+        return matrix;
+    }
+
+    void loadConfirmedPreview() {
+        savedMatrix_ = nullptr;
+        savedPoseSameFrame_ = false;
+        if (projectDb_.isEmpty() || modelRoot_.isEmpty() || cloudPath_.isEmpty()) {
+            metrics_->setText(QStringLiteral("정합 결과 없음"));
+            return;
+        }
+        const QString connection = id();
+        QString matrixJson, method;
+        double rmse = 0, overlap = 0;
+        bool poseFrame = false;
+        {
+            auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
+            db.setDatabaseName(projectDb_);
+            if (db.open() && db.tables().contains(QStringLiteral("registration_result"))) {
+                QSqlQuery query(db);
+                query.prepare(QStringLiteral("SELECT source_cloud_path,model_root,matrix_json,method,"
+                    "surface_rmse,overlap,pose_frame_confirmed FROM registration_result "
+                    "WHERE active=1 AND review_status='CONFIRMED' AND (?='' OR inspection_id=?) "
+                    "ORDER BY confirmed_at DESC LIMIT 20"));
+                query.addBindValue(inspectionId_); query.addBindValue(inspectionId_);
+                if (query.exec()) while (query.next()) {
+                    const auto samePath = [](const QString &left, const QString &right) {
+                        return QDir::cleanPath(QFileInfo(left).absoluteFilePath()).compare(
+                            QDir::cleanPath(QFileInfo(right).absoluteFilePath()), Qt::CaseInsensitive) == 0;
+                    };
+                    if (!samePath(query.value(0).toString(), cloudPath_) ||
+                        !samePath(query.value(1).toString(), modelRoot_)) continue;
+                    matrixJson = query.value(2).toString(); method = query.value(3).toString();
+                    rmse = query.value(4).toDouble(); overlap = query.value(5).toDouble();
+                    poseFrame = query.value(6).toBool();
+                    break;
+                }
+            }
+            db.close();
+        }
+        QSqlDatabase::removeDatabase(connection);
+        savedMatrix_ = matrixFromJson(matrixJson);
+        if (!savedMatrix_) {
+            metrics_->setText(QStringLiteral("정합 결과 없음"));
+            updateOverlay(false);
+            return;
+        }
+        savedPoseSameFrame_ = poseFrame;
+        matrix_ = nullptr;
+        reviewId_.clear();
+        save_->setEnabled(false); confirm_->setEnabled(false);
+        poseSameFrame_->setChecked(poseFrame);
+        metrics_->setText(QStringLiteral("확정된 정합 · %1 · 표면 RMSE %2 m · 0.5 m 이내 %3%")
+            .arg(method).arg(rmse, 0, 'f', 3).arg(overlap * 100, 0, 'f', 1));
+        status_->setText(QStringLiteral("확정된 정합을 불러왔습니다. 부재 표시는 정합 행렬을 변경하지 않습니다."));
+        updateOverlay();
+        views_->setCurrentIndex(1);
+    }
+
+    void updateOverlay(bool refit = true) {
         resultView_->renderer()->RemoveAllViewProps();
-        if (model_) resultView_->renderer()->AddActor(modelActor(model_, 0.2));
-        if (selectedModel_) {
-            auto selected = modelActor(selectedModel_, 0.55);
+        overlayCloud_ = nullptr;
+        const bool aligned = previewAligned_->isChecked();
+        vtkMatrix4x4 *previewMatrix = matrix_ ? matrix_.GetPointer() : savedMatrix_.GetPointer();
+        const bool showAlignedPoses = matrix_ ? poseSameFrame_->isChecked() : savedPoseSameFrame_;
+        const bool wireframe = previewModelMode_->currentIndex() == 1;
+        if (aligned && model_) {
+            auto context = modelActor(model_, wireframe ? 0.45 : 0.2);
+            if (wireframe) {
+                context->GetProperty()->SetRepresentationToWireframe();
+                context->GetProperty()->SetLineWidth(1.0);
+            }
+            resultView_->renderer()->AddActor(context);
+        }
+        if (aligned && selectedModel_) {
+            auto selected = modelActor(selectedModel_, wireframe ? 1.0 : 0.55);
             selected->GetProperty()->SetColor(0.16, 0.82, 0.67);
+            if (wireframe) {
+                selected->GetProperty()->SetRepresentationToWireframe();
+                selected->GetProperty()->SetLineWidth(2.0);
+            }
             resultView_->renderer()->AddActor(selected);
         }
-        if (cloudGeometry_) {
+        if (cloudGeometry_ && showPreviewCloud_->isChecked()) {
             overlayCloud_ = cloudActor(cloudGeometry_, activeCloud_);
-            if (matrix_) overlayCloud_->SetUserMatrix(matrix_);
+            if (aligned && previewMatrix) overlayCloud_->SetUserMatrix(previewMatrix);
             resultView_->renderer()->AddActor(overlayCloud_);
         }
-        if (model_ || cloudGeometry_) resultView_->fit();
+        if (refit && (cloudGeometry_ || (aligned && model_))) resultView_->fit();
+        if ((!aligned || (previewMatrix && showAlignedPoses)) && !cameras_.isEmpty()) {
+            QVector<QVector3D> centers;
+            centers.reserve(cameras_.size());
+            for (const auto &item : cameras_)
+                centers.append(aligned ? RegistrationEngine::transformPoint(previewMatrix, item.pose.position) : item.pose.position);
+            if (showCameraCenters_->isChecked())
+                resultView_->renderer()->AddActor(cameraCentersActor(centers));
+            const int selected = previewCamera_->currentIndex();
+            if (showSelectedFrustum_->isChecked() && selected >= 0 && selected < cameras_.size()) {
+                const auto &item = cameras_[selected];
+                const auto position = centers[selected];
+                const auto orientation = aligned ?
+                    RegistrationEngine::transformOrientation(previewMatrix, item.pose.orientation) : item.pose.orientation;
+                const double cameraColor[3]{1.0, 0.74, 0.22};
+                auto selectedMarker = marker(position, markerRadius(selectedModel_ ? selectedModel_.GetPointer() : model_.GetPointer()) * 1.5,
+                                             cameraColor);
+                selectedMarker->PickableOff();
+                resultView_->renderer()->AddActor(selectedMarker);
+                resultView_->renderer()->AddActor(cameraFrustumActor(position, orientation, previewIntrinsics_,
+                    item.width, item.height, 0.8));
+            }
+        }
+        resultView_->renderer()->ResetCameraClippingRange();
+        resultView_->refresh();
     }
 
     void presentResult(const QString &method, vtkMatrix4x4 *matrix, double landmarkRmse,
                        int iterations) {
+        reviewId_.clear();
+        confirm_->setEnabled(false);
+        poseSameFrame_->setEnabled(!cameras_.isEmpty());
         matrix_ = vtkSmartPointer<vtkMatrix4x4>::New();
         matrix_->DeepCopy(matrix);
         method_ = method;
@@ -955,7 +1417,28 @@ private:
         views_->setCurrentIndex(1);
         status_->setText(resultMetrics_.overlap < 0.2 ?
             QStringLiteral("겹침이 낮습니다. 기준점·축·점군 범위를 검토하십시오.") :
-            QStringLiteral("결과를 검토한 뒤 채택할 수 있습니다."));
+            QStringLiteral("결과를 검토한 뒤 후보로 저장할 수 있습니다."));
+    }
+
+    void showSavedReview(const RegistrationReviewInfo &review) {
+        if (!model_ || !cloudGeometry_) return;
+        auto loaded = matrixFromJson(review.matrixJson);
+        if (!loaded) return;
+        matrix_ = loaded;
+        savedMatrix_ = loaded;
+        savedPoseSameFrame_ = review.transformPoses;
+        icpStart_ = nullptr;
+        method_ = review.method;
+        reviewId_ = review.id;
+        poseSameFrame_->setChecked(review.transformPoses);
+        poseSameFrame_->setEnabled(false);
+        save_->setEnabled(false);
+        confirm_->setEnabled(true);
+        metrics_->setText(QStringLiteral("저장된 후보 · %1 · 표면 RMSE %2 m · 0.5 m 이내 %3%")
+            .arg(review.method).arg(review.surfaceRmse, 0, 'f', 3).arg(review.overlap * 100, 0, 'f', 1));
+        updateOverlay();
+        views_->setCurrentIndex(1);
+        status_->setText(QStringLiteral("미검토 정합 후보입니다. 미리보기 확인 후 확정하십시오."));
     }
 
     void runManual() {
@@ -967,11 +1450,16 @@ private:
         vtkNew<vtkMatrix4x4> fit;
         double rmse = 0;
         QString error;
+        const QString runId = startRegistrationRun();
         if (!RegistrationEngine::landmarks(sourcePairs_, targetPairs_, allowScale_->isChecked(),
                                             fit, &rmse, &error)) {
+            finishRegistrationRun(runId, QStringLiteral("FAILED"), error);
             QMessageBox::information(this, QStringLiteral("대응점 확인"), error); return;
         }
+        icpStart_ = vtkSmartPointer<vtkMatrix4x4>::New();
+        icpStart_->DeepCopy(fit);
         presentResult(QStringLiteral("수동"), fit, rmse, 0);
+        finishRegistrationRun(runId, QStringLiteral("REVIEW"), {});
     }
 
     void runIcp() {
@@ -984,17 +1472,54 @@ private:
                 QStringLiteral("자동 정합에 사용할 모델 부재를 하나 이상 선택하십시오."));
             return;
         }
+        if (sideMode_->currentData().toInt() == 0) {
+            QMessageBox::information(this, QStringLiteral("조사 모드 필요"),
+                QStringLiteral("외관 조사 또는 내부 조사를 선택하십시오."));
+            return;
+        }
+        if (missingSideParts_ > 0) {
+            QMessageBox::information(this, QStringLiteral("모델 면 정보 부족"),
+                QStringLiteral("선택 부재 중 %1개에 해당 조사면의 OBJ 그룹(-EX-/-IN-)이 없습니다.")
+                    .arg(missingSideParts_));
+            return;
+        }
+        const QString runId = startRegistrationRun();
         QApplication::setOverrideCursor(Qt::WaitCursor);
         vtkNew<vtkMatrix4x4> fit;
         int iterations = 0;
         QString error;
-        const bool ok = RegistrationEngine::icp(cloudGeometry_, selectedModel_, matrix_, fit, &iterations, &error);
+        const bool similarity = icpSimilarity_->isChecked();
+        const bool ok = RegistrationEngine::icp(cloudGeometry_, selectedModel_, icpStart_, similarity,
+                                                 fit, &iterations, &error);
         QApplication::restoreOverrideCursor();
         if (!ok) {
+            finishRegistrationRun(runId, QStringLiteral("FAILED"), error);
             QMessageBox::warning(this, QStringLiteral("ICP 실패"), error); return;
         }
-        presentResult(matrix_ ? QStringLiteral("수동 + ICP") : QStringLiteral("ICP"),
+        presentResult((icpStart_ ? QStringLiteral("수동 + ICP · ") : QStringLiteral("ICP · ")) +
+                      (similarity ? QStringLiteral("Similarity · ") : QStringLiteral("RigidBody · ")) +
+                      sideMode_->currentText(),
                       fit, landmarkRmse_, iterations);
+        finishRegistrationRun(runId, QStringLiteral("REVIEW"), {});
+    }
+
+    QString startRegistrationRun() {
+        if (projectDb_.isEmpty()) return {};
+        const QString runId = id();
+        QString error;
+        if (!ProjectStore::recordRun(projectDb_, {runId, inspectionId_, QStringLiteral("registration"),
+            QStringLiteral("RUNNING"), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs), {}, {}}, &error)) {
+            QMessageBox::warning(this, QStringLiteral("작업 이력 저장 실패"), error);
+            return {};
+        }
+        return runId;
+    }
+
+    void finishRegistrationRun(const QString &runId, const QString &runStatus, const QString &message) {
+        if (runId.isEmpty()) return;
+        QString error;
+        if (!ProjectStore::finishRun(projectDb_, runId, runStatus, message, &error))
+            QMessageBox::warning(this, QStringLiteral("작업 현황 갱신 실패"), error);
     }
 
     double pairRmse(vtkMatrix4x4 *matrix) const {
@@ -1045,34 +1570,35 @@ private:
     void saveResult() {
         if (!matrix_ || projectDb_.isEmpty()) return;
         const bool hasDataset = !cloudList_->currentData(Qt::UserRole + 2).toString().isEmpty();
+        if (poseSameFrame_->isChecked() && hasDataset &&
+            QMessageBox::question(this, QStringLiteral("카메라 위치·자세 변환 확인"),
+                QStringLiteral("카메라 초기 pose와 LAS가 동일한 원본 좌표계입니까?\n"
+                               "예를 선택하면 검토 확정 시 카메라 pose에도 정합 행렬을 적용합니다.")) != QMessageBox::Yes)
+            return;
         if (poseSameFrame_->isChecked() && !hasDataset &&
             QMessageBox::question(this, QStringLiteral("카메라 자세 갱신 불가"),
-                QStringLiteral("이 LAS는 변환기 데이터 세트에 연결되지 않아 카메라 위치·자세를 갱신할 수 없습니다. 정합 행렬만 저장하시겠습니까?")) != QMessageBox::Yes)
+                QStringLiteral("이 LAS는 이미지 데이터 세트에 연결되지 않았습니다. 카메라 pose 변환 없이 후보만 저장하시겠습니까?")) != QMessageBox::Yes)
             return;
         if (resultMetrics_.overlap < 0.2 &&
             QMessageBox::question(this, QStringLiteral("정합 결과 확인"),
                 QStringLiteral("0.5 m 이내 점 비율이 20% 미만입니다. 그래도 저장하시겠습니까?")) != QMessageBox::Yes)
             return;
-        const QString connection = id();
         QString error;
-        int poseCount = 0;
+        if (!ProjectStore::ensureRegistrationSchema(projectDb_, &error)) {
+            QMessageBox::warning(this, QStringLiteral("정합 결과 저장 실패"), error);
+            return;
+        }
+        const QString connection = id();
         bool saved = false;
+        QString savedId;
         {
             auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), connection);
             db.setDatabaseName(projectDb_);
             if (!db.open()) error = db.lastError().text();
+            else if (!db.transaction()) error = db.lastError().text();
             else {
-                QSqlQuery schema(db);
-                const bool ready = schema.exec(QStringLiteral("CREATE TABLE IF NOT EXISTS registration_result ("
-                    "registration_id TEXT PRIMARY KEY, dataset_id TEXT, point_cloud_id TEXT, "
-                    "source_cloud_path TEXT NOT NULL, model_root TEXT NOT NULL, method TEXT NOT NULL, "
-                    "matrix_json TEXT NOT NULL, scale REAL NOT NULL, landmark_rmse REAL, "
-                    "surface_rmse REAL, overlap REAL, icp_iterations INTEGER, "
-                    "pose_frame_confirmed INTEGER NOT NULL, created_at TEXT NOT NULL, active INTEGER NOT NULL)"));
-                if (!ready) error = schema.lastError().text();
-                else if (!db.transaction()) error = db.lastError().text();
-                else {
                     const QString resultId = id();
+                    const QString runId = id();
                     const int row = cloudList_->currentIndex();
                     const QString datasetId = cloudList_->itemData(row, Qt::UserRole + 2).toString();
                     const QString cloudId = cloudList_->itemData(row, Qt::UserRole + 1).toString();
@@ -1082,13 +1608,13 @@ private:
                         for (int c = 0; c < 4; ++c) columns.append(matrix_->GetElement(r, c));
                         rows.append(columns);
                     }
-                    QSqlQuery deactivate(db);
-                    deactivate.prepare(QStringLiteral("UPDATE registration_result SET active=0 WHERE source_cloud_path=?"));
-                    deactivate.addBindValue(cloudPath_);
-                    bool ok = deactivate.exec();
                     QSqlQuery insert(db);
-                    insert.prepare(QStringLiteral("INSERT INTO registration_result VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"));
+                    insert.prepare(QStringLiteral("INSERT INTO registration_result (registration_id,inspection_id,dataset_id,point_cloud_id,"
+                        "source_cloud_path,model_root,method,matrix_json,scale,landmark_rmse,surface_rmse,overlap,"
+                        "icp_iterations,pose_frame_confirmed,created_at,active,survey_side,review_status,run_id) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"));
                     insert.addBindValue(resultId);
+                    insert.addBindValue(inspectionId_.isEmpty() ? QVariant() : QVariant(inspectionId_));
                     insert.addBindValue(datasetId);
                     insert.addBindValue(cloudId);
                     insert.addBindValue(cloudPath_);
@@ -1102,79 +1628,87 @@ private:
                     insert.addBindValue(iterations_);
                     insert.addBindValue(poseSameFrame_->isChecked() && hasDataset ? 1 : 0);
                     insert.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
-                    insert.addBindValue(1);
-                    if (ok) ok = insert.exec();
-                    if (ok && poseSameFrame_->isChecked() && !datasetId.isEmpty())
-                        ok = saveCameraPoses(db, datasetId, resultId, &poseCount, &error);
+                    insert.addBindValue(0);
+                    insert.addBindValue(sideMode_->currentData().toInt() == 1 ? QStringLiteral("EXTERIOR") :
+                                        sideMode_->currentData().toInt() == 2 ? QStringLiteral("INTERIOR") : QString());
+                    insert.addBindValue(QStringLiteral("PENDING"));
+                    insert.addBindValue(runId);
+                    bool ok = insert.exec();
+                    QSqlQuery run(db);
+                    if (ok) {
+                        run.prepare(QStringLiteral("INSERT INTO module_run VALUES(?,?,?,?,?,?,?)"));
+                        run.addBindValue(runId);
+                        run.addBindValue(inspectionId_.isEmpty() ? QVariant() : QVariant(inspectionId_));
+                        run.addBindValue(QStringLiteral("registration"));
+                        run.addBindValue(QStringLiteral("REVIEW"));
+                        const QString now = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+                        run.addBindValue(now);
+                        run.addBindValue(now);
+                        run.addBindValue(QStringLiteral(""));
+                        ok = run.exec();
+                    }
                     if (ok && db.commit()) saved = true;
                     else {
                         if (error.isEmpty()) error = ok ? db.lastError().text() :
-                            insert.lastError().isValid() ? insert.lastError().text() : deactivate.lastError().text();
+                            run.lastError().isValid() ? run.lastError().text() : insert.lastError().text();
                         db.rollback();
                     }
-                }
-                db.close();
+                    if (saved) savedId = resultId;
             }
+            db.close();
         }
         QSqlDatabase::removeDatabase(connection);
         if (saved) {
-            status_->setText(QStringLiteral("정합 결과 저장 · 카메라 pose %1개 갱신").arg(poseCount));
-            QMessageBox::information(this, QStringLiteral("저장 완료"), status_->text());
+            reviewId_ = savedId;
+            savedMatrix_ = vtkSmartPointer<vtkMatrix4x4>::New();
+            savedMatrix_->DeepCopy(matrix_);
+            savedPoseSameFrame_ = poseSameFrame_->isChecked() && hasDataset;
+            save_->setEnabled(false);
+            confirm_->setEnabled(true);
+            poseSameFrame_->setEnabled(false);
+            status_->setText(QStringLiteral("정합 후보 저장 완료 · 검토 확정 전에는 활성 결과와 카메라 pose가 변경되지 않습니다."));
+            QMessageBox::information(this, QStringLiteral("후보 저장 완료"), status_->text());
         } else QMessageBox::warning(this, QStringLiteral("저장 실패"), error);
     }
 
-    bool saveCameraPoses(QSqlDatabase &db, const QString &datasetId, const QString &registrationId,
-                         int *count, QString *error) {
-        QSqlQuery initial(db);
-        initial.prepare(QStringLiteral("SELECT p.image_id,p.pose_json FROM camera_pose p "
-            "JOIN image i ON i.image_id=p.image_id WHERE i.dataset_id=? AND p.pose_stage='INITIAL'"));
-        initial.addBindValue(datasetId);
-        if (!initial.exec()) { *error = initial.lastError().text(); return false; }
-        while (initial.next()) {
-            const auto pose = QJsonDocument::fromJson(initial.value(1).toString().toUtf8()).object();
-            const auto position = pose.value(QStringLiteral("position")).toObject();
-            const auto orientation = pose.value(QStringLiteral("orientation")).toObject();
-            if (position.isEmpty() || orientation.isEmpty()) continue;
-            const QVector3D center(float(position.value(QStringLiteral("x")).toDouble()),
-                                   float(position.value(QStringLiteral("y")).toDouble()),
-                                   float(position.value(QStringLiteral("z")).toDouble()));
-            const QQuaternion rotation(float(orientation.value(QStringLiteral("w")).toDouble()),
-                                       float(orientation.value(QStringLiteral("x")).toDouble()),
-                                       float(orientation.value(QStringLiteral("y")).toDouble()),
-                                       float(orientation.value(QStringLiteral("z")).toDouble()));
-            const auto aligned = RegistrationEngine::transformPoint(matrix_, center);
-            const auto turned = RegistrationEngine::transformOrientation(matrix_, rotation.normalized());
-            QJsonObject output = pose;
-            output.insert(QStringLiteral("position"), QJsonObject{{QStringLiteral("x"), aligned.x()},
-                {QStringLiteral("y"), aligned.y()}, {QStringLiteral("z"), aligned.z()}});
-            output.insert(QStringLiteral("orientation"), QJsonObject{{QStringLiteral("w"), turned.scalar()},
-                {QStringLiteral("x"), turned.x()}, {QStringLiteral("y"), turned.y()},
-                {QStringLiteral("z"), turned.z()}});
-            output.insert(QStringLiteral("registration_id"), registrationId);
-            QSqlQuery upsert(db);
-            upsert.prepare(QStringLiteral("INSERT INTO camera_pose VALUES(?,?,?,?,?,?) "
-                "ON CONFLICT(image_id,pose_stage) DO UPDATE SET pose_json=excluded.pose_json, "
-                "source_kind=excluded.source_kind,status=excluded.status"));
-            upsert.addBindValue(id());
-            upsert.addBindValue(initial.value(0));
-            upsert.addBindValue(QStringLiteral("MODEL_ALIGNED"));
-            upsert.addBindValue(QString::fromUtf8(QJsonDocument(output).toJson(QJsonDocument::Compact)));
-            upsert.addBindValue(QStringLiteral("REGISTRATION"));
-            upsert.addBindValue(QStringLiteral("REVIEW"));
-            if (!upsert.exec()) { *error = upsert.lastError().text(); return false; }
-            ++*count;
+    void confirmSavedResult() {
+        if (reviewId_.isEmpty() || projectDb_.isEmpty()) return;
+        if (QMessageBox::question(this, QStringLiteral("정합 결과 확정"),
+            QStringLiteral("검토한 정합 후보를 확정하시겠습니까? 기존 활성 정합을 교체하고, "
+                           "선택한 경우 카메라 pose도 모델 좌표계로 갱신합니다.")) != QMessageBox::Yes) return;
+        QString error;
+        int poseCount = 0;
+        if (!ProjectStore::confirmRegistration(projectDb_, reviewId_, &poseCount, &error)) {
+            QMessageBox::warning(this, QStringLiteral("확정 실패"), error);
+            return;
         }
-        return true;
+        reviewId_.clear();
+        confirm_->setEnabled(false);
+        if (matrix_) {
+            savedMatrix_ = vtkSmartPointer<vtkMatrix4x4>::New();
+            savedMatrix_->DeepCopy(matrix_);
+        }
+        savedPoseSameFrame_ = poseSameFrame_->isChecked();
+        status_->setText(QStringLiteral("정합 결과 확정 완료 · 카메라 pose %1장 갱신").arg(poseCount));
+        QMessageBox::information(this, QStringLiteral("확정 완료"), status_->text());
     }
 
-    QString projectDb_, facilityId_, inspectionId_, modelRoot_, cloudPath_, method_;
+    QString projectDb_, facilityId_, inspectionId_, modelRoot_, cloudPath_, method_, reviewId_;
     QLineEdit *modelPath_ = nullptr;
-    QComboBox *units_ = nullptr, *cloudList_ = nullptr, *modelMode_ = nullptr;
+    QComboBox *units_ = nullptr, *cloudList_ = nullptr, *modelMode_ = nullptr, *sideMode_ = nullptr;
+    int missingSideParts_ = 0;
     QListWidget *partList_ = nullptr;
     QLabel *modelInfo_ = nullptr, *selectedInfo_ = nullptr, *cloudInfo_ = nullptr, *metrics_ = nullptr, *status_ = nullptr;
     QTableWidget *pairs_ = nullptr;
     QCheckBox *allowScale_ = nullptr, *poseSameFrame_ = nullptr;
-    QPushButton *save_ = nullptr;
+    QPushButton *icpSimilarity_ = nullptr;
+    QCheckBox *showPreviewCloud_ = nullptr, *showCameraCenters_ = nullptr, *showSelectedFrustum_ = nullptr;
+    QPushButton *previewOriginal_ = nullptr, *previewAligned_ = nullptr;
+    QComboBox *previewCamera_ = nullptr, *previewModelMode_ = nullptr;
+    QLabel *cameraStatus_ = nullptr;
+    QVector<CameraPreviewItem> cameras_;
+    PreviewIntrinsics previewIntrinsics_;
+    QPushButton *save_ = nullptr, *confirm_ = nullptr;
     QTabWidget *views_ = nullptr;
     PickView *sourceView_ = nullptr, *targetView_ = nullptr, *resultView_ = nullptr;
     CloudPreview cloud_, activeCloud_;
@@ -1183,7 +1717,8 @@ private:
     vtkSmartPointer<vtkActor> pendingSourceMarker_, pendingTargetMarker_;
     QVector<vtkSmartPointer<vtkBillboardTextActor3D>> sourceLabels_, targetLabels_;
     QVector<RegistrationPart> parts_;
-    vtkSmartPointer<vtkMatrix4x4> matrix_, previousMatrix_;
+    vtkSmartPointer<vtkMatrix4x4> matrix_, savedMatrix_, icpStart_, previousMatrix_;
+    bool savedPoseSameFrame_ = false;
     QDoubleSpinBox *adjustValues_[6]{};
     QVector3D adjustPivot_;
     QVector<vtkSmartPointer<vtkActor>> sourceMarkers_, targetMarkers_;
@@ -1197,7 +1732,7 @@ private:
 
 int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
-    QString project, facility, inspection, model, cloud, capture;
+    QString project, facility, inspection, model, cloud, review, capture;
     const auto args = app.arguments();
     for (int i = 1; i < args.size(); ++i) {
         if (args[i] == QStringLiteral("--project") && i + 1 < args.size()) project = args[++i];
@@ -1205,9 +1740,10 @@ int main(int argc, char *argv[]) {
         else if (args[i] == QStringLiteral("--inspection") && i + 1 < args.size()) inspection = args[++i];
         else if (args[i] == QStringLiteral("--model") && i + 1 < args.size()) model = args[++i];
         else if (args[i] == QStringLiteral("--cloud") && i + 1 < args.size()) cloud = args[++i];
+        else if (args[i] == QStringLiteral("--review") && i + 1 < args.size()) review = args[++i];
         else if (args[i] == QStringLiteral("--capture-ui") && i + 1 < args.size()) capture = args[++i];
     }
-    RegistrationWindow window(project, facility, inspection, model, cloud);
+    RegistrationWindow window(project, facility, inspection, model, cloud, review);
     window.show();
     if (!capture.isEmpty()) QTimer::singleShot(1800, &window, [&] {
         window.grab().save(capture);

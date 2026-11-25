@@ -59,6 +59,21 @@ struct ArtifactInfo {
     bool active = false;
 };
 
+struct RegistrationReviewInfo {
+    QString id;
+    QString inspectionId;
+    QString datasetId;
+    QString cloudPath;
+    QString modelRoot;
+    QString method;
+    QString matrixJson;
+    QString surveySide;
+    QString createdAt;
+    bool transformPoses = false;
+    double surfaceRmse = 0;
+    double overlap = 0;
+};
+
 class ProjectStore {
 public:
     static bool create(const QString &directory, const QString &name, QString *error);
@@ -84,6 +99,13 @@ public:
     static bool runs(const QString &databasePath, const QString &inspectionId, QList<ModuleRunInfo> *items, QString *error);
     static bool artifacts(const QString &databasePath, QList<ArtifactInfo> *items, QString *error);
     static bool recordRun(const QString &databasePath, const ModuleRunInfo &run, QString *error);
+    static bool finishRun(const QString &databasePath, const QString &runId, const QString &status,
+                          const QString &message, QString *error);
+    static bool ensureRegistrationSchema(const QString &databasePath, QString *error);
+    static bool pendingRegistrations(const QString &databasePath, const QString &inspectionId,
+                                     QList<RegistrationReviewInfo> *items, QString *error);
+    static bool confirmRegistration(const QString &databasePath, const QString &registrationId,
+                                    int *poseCount, QString *error);
     static bool recordArtifact(const QString &databasePath, const ArtifactInfo &artifact, QString *error);
     static bool adoptArtifact(const QString &databasePath, const QString &artifactId, QString *error);
     static bool linkArtifacts(const QString &databasePath, const QString &parentId, const QString &childId, QString *error);
