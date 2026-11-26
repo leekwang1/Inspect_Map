@@ -5,6 +5,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QLineF>
+#include <QMap>
 #include <QTextStream>
 #include <QXmlStreamReader>
 #include <algorithm>
@@ -13,81 +14,6 @@
 
 namespace {
 struct DxfPair { int code; QString value; };
-
-struct UnrollInsert {
-    QString faceId;
-    QString block;
-    QString direction;
-    QPointF position;
-    double sx = 1, sy = 1, rotation = 0;
-};
-
-QVector<QPointF> dxfVertices(const QVector<DxfPair> &pairs, int begin, int end) {
-    QVector<QPointF> points;
-    for (int i = begin; i < end; ++i) {
-        if (pairs[i].code == 10) points.append(QPointF(pairs[i].value.toDouble(), 0));
-        else if (pairs[i].code == 20 && !points.isEmpty()) points.last().setY(pairs[i].value.toDouble());
-    }
-    return points;
-}
-
-bool readUnrollDxf(const QString &path, QHash<QString, QVector<QPointF>> *blocks,
-                   QVector<UnrollInsert> *inserts, QString *error) {
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        if (error) *error = file.errorString();
-        return false;
-    }
-    QVector<DxfPair> pairs;
-    QTextStream stream(&file);
-    while (!stream.atEnd()) {
-        const QString codeText = stream.readLine().trimmed();
-        if (stream.atEnd()) break;
-        bool ok = false;
-        const int code = codeText.toInt(&ok);
-        const QString value = stream.readLine().trimmed();
-        if (ok) pairs.append({code, value});
-    }
-    QString section, blockName;
-    for (int i = 0; i < pairs.size();) {
-        if (pairs[i].code != 0) { ++i; continue; }
-        const QString type = pairs[i].value;
-        int end = i + 1;
-        while (end < pairs.size() && pairs[end].code != 0) ++end;
-        if (type == QStringLiteral("SECTION")) {
-            section.clear();
-            for (int j = i + 1; j < end; ++j) if (pairs[j].code == 2) section = pairs[j].value;
-        } else if (type == QStringLiteral("ENDSEC")) section.clear();
-        else if (section == QStringLiteral("BLOCKS")) {
-            if (type == QStringLiteral("BLOCK")) {
-                blockName.clear();
-                for (int j = i + 1; j < end; ++j) if (pairs[j].code == 2) { blockName = pairs[j].value; break; }
-            } else if (type == QStringLiteral("ENDBLK")) blockName.clear();
-            else if (type == QStringLiteral("LWPOLYLINE") && !blockName.isEmpty()) {
-                auto polygon = dxfVertices(pairs, i + 1, end);
-                if (polygon.size() == 4 && !blocks->contains(blockName)) blocks->insert(blockName, std::move(polygon));
-            }
-        } else if (section == QStringLiteral("ENTITIES") && type == QStringLiteral("INSERT")) {
-            UnrollInsert insert;
-            for (int j = i + 1; j < end; ++j) {
-                const auto &pair = pairs[j];
-                if (pair.code == 2) insert.block = pair.value;
-                else if (pair.code == 10) insert.position.setX(pair.value.toDouble());
-                else if (pair.code == 20) insert.position.setY(pair.value.toDouble());
-                else if (pair.code == 41) insert.sx = pair.value.toDouble();
-                else if (pair.code == 42) insert.sy = pair.value.toDouble();
-                else if (pair.code == 50) insert.rotation = pair.value.toDouble();
-                else if (pair.code == 1000 && pair.value.startsWith(QStringLiteral("FACE_ID=")))
-                    insert.faceId = pair.value.mid(8);
-                else if (pair.code == 1000 && pair.value.startsWith(QStringLiteral("DIR=")))
-                    insert.direction = pair.value.mid(4);
-            }
-            if (!insert.faceId.isEmpty()) inserts->append(insert);
-        }
-        i = end;
-    }
-    return true;
-}
 
 bool quadCorners(const QVector<MapTriangle> &triangles, QVector<QVector3D> *corners) {
     QVector<QVector3D> vertices;
@@ -140,33 +66,6 @@ bool populateTriangleMaps(const QVector<QVector3D> &corners, const QVector<QPoin
         face->triangles.append({triangle, mapped[0], mapped[1], mapped[2]});
     }
     return true;
-}
-
-bool makeUnrollFace(const UnrollInsert &insert, const QVector<QPointF> &block,
-                    const QVector<MapTriangle> &triangles, UnrollFace *face) {
-    if (std::abs(insert.rotation) > 1e-6 || insert.sx <= 0 || insert.sy <= 0) return false;
-    QVector<QVector3D> corners;
-    if (!quadCorners(triangles, &corners)) return false;
-    QVector<QPointF> polygon;
-    for (const auto &point : block)
-        polygon.append(QPointF((insert.position.x()+point.x()*insert.sx)*0.001,
-                                -(insert.position.y()+point.y()*insert.sy)*0.001));
-    if (polygon.size() != 4) return false;
-    double lowY = std::numeric_limits<double>::infinity(), highY = -lowY;
-    for (const auto &point : polygon) { lowY = std::min(lowY, point.y()); highY = std::max(highY, point.y()); }
-    QVector<QPointF> top, bottom;
-    for (const auto &point : polygon) (std::abs(point.y()-lowY) < std::abs(point.y()-highY) ? top : bottom).append(point);
-    if (top.size() != 2 || bottom.size() != 2) return false;
-    const QVector<QPointF> destination{
-        top[0].x() < top[1].x() ? top[0] : top[1],
-        bottom[0].x() < bottom[1].x() ? bottom[0] : bottom[1],
-        bottom[0].x() < bottom[1].x() ? bottom[1] : bottom[0],
-        top[0].x() < top[1].x() ? top[1] : top[0]};
-    face->faceId = insert.faceId;
-    face->partId = insert.faceId.section(QLatin1Char('-'), 0, 3);
-    face->direction = insert.direction;
-    face->outline = destination;
-    return populateTriangleMaps(corners, destination, triangles, face);
 }
 
 UnrollSheet generatedUnrollSheet(const QString &part, const QString &side,
@@ -258,6 +157,106 @@ UnrollSheet generatedUnrollSheet(const QString &part, const QString &side,
         current = forward ? segment.b : segment.a;
         offset += width;
     }
+    return sheet;
+}
+
+UnrollSheet generatedSeriesSheet(const QString &series, const QString &side,
+                                 const QStringList &parts,
+                                 const QHash<QString, QVector<MapTriangle>> &faceTriangles) {
+    struct FaceData { QString id, part, direction; QVector<MapTriangle> triangles; };
+    const QStringList directions{QStringLiteral("FR"), QStringLiteral("RG"),
+                                 QStringLiteral("RR"), QStringLiteral("LF")};
+    QSet<QString> partSet(parts.cbegin(), parts.cend());
+    QMap<QString, QVector<FaceData>> facesByDirection;
+    for (auto it = faceTriangles.cbegin(); it != faceTriangles.cend(); ++it) {
+        if (it.value().isEmpty() || !partSet.contains(it.value().first().partId) ||
+            it.key().contains(QStringLiteral("-CAP-"))) continue;
+        const QString faceSide = it.key().contains(QStringLiteral("-EX-")) ? QStringLiteral("EX") :
+                                 it.key().contains(QStringLiteral("-IN-")) ? QStringLiteral("IN") : QStringLiteral("GEN");
+        const QString direction = it.key().section(QLatin1Char('-'), -2, -2);
+        if (faceSide != side || !directions.contains(direction)) continue;
+        facesByDirection[direction].append({it.key(), it.value().first().partId,
+                                            direction, it.value()});
+    }
+    UnrollSheet sheet;
+    sheet.id = series + QLatin1Char('|') + side;
+    sheet.series = series;
+    sheet.side = side;
+    double offset = 0;
+    for (const auto &direction : directions) {
+        auto &faces = facesByDirection[direction];
+        if (faces.isEmpty()) continue;
+        std::sort(faces.begin(), faces.end(), [](const auto &a, const auto &b) { return a.id < b.id; });
+        QPointF axis;
+        for (const auto &face : faces) {
+            QVector<QVector3D> corners;
+            if (quadCorners(face.triangles, &corners)) {
+                const auto edge = corners[2] - corners[1];
+                const QPointF candidate(edge.x(), edge.y());
+                const double length = std::hypot(candidate.x(), candidate.y());
+                if (length > 0.001) { axis = candidate / length; break; }
+            }
+        }
+        if (std::hypot(axis.x(), axis.y()) < 0.5) continue;
+        auto horizontal = [&axis](const QVector3D &point) {
+            return double(point.x())*axis.x() + double(point.y())*axis.y();
+        };
+        double low = std::numeric_limits<double>::infinity(), high = -low;
+        for (const auto &face : faces) for (const auto &triangle : face.triangles)
+            for (const auto &point : {triangle.a, triangle.b, triangle.c}) {
+                low = std::min(low, horizontal(point)); high = std::max(high, horizontal(point));
+        }
+        if (!(high-low > 0.001)) continue;
+        for (const auto &face : faces) {
+            UnrollFace mapped;
+            mapped.faceId = face.id; mapped.partId = face.part; mapped.direction = direction;
+            auto flatten = [&](const QVector3D &point) {
+                return QPointF(offset + horizontal(point)-low, -double(point.z()));
+            };
+            QVector<QVector3D> vertices;
+            QMap<QPair<int, int>, int> edgeCounts;
+            auto vertexIndex = [&vertices](const QVector3D &point) -> int {
+                for (int i = 0; i < vertices.size(); ++i)
+                    if ((vertices[i]-point).length() < 0.0001f) return i;
+                vertices.append(point); return vertices.size()-1;
+            };
+            for (const auto &triangle : face.triangles) {
+                const int indices[3]{vertexIndex(triangle.a), vertexIndex(triangle.b), vertexIndex(triangle.c)};
+                for (int j = 0; j < 3; ++j) {
+                    const int a = indices[j], b = indices[(j+1)%3];
+                    ++edgeCounts[{std::min(a,b), std::max(a,b)}];
+                }
+                mapped.triangles.append({triangle, flatten(triangle.a), flatten(triangle.b),
+                                         flatten(triangle.c)});
+            }
+            QHash<int, QVector<int>> boundary;
+            int boundaryEdges = 0;
+            for (auto it = edgeCounts.cbegin(); it != edgeCounts.cend(); ++it)
+                if (it.value() == 1) {
+                    boundary[it.key().first].append(it.key().second);
+                    boundary[it.key().second].append(it.key().first);
+                    ++boundaryEdges;
+                }
+            if (boundaryEdges < 3) continue;
+            int start = boundary.cbegin().key();
+            for (auto it = boundary.cbegin(); it != boundary.cend(); ++it)
+                if (flatten(vertices[it.key()]).x() < flatten(vertices[start]).x()) start = it.key();
+            int previous = -1, current = start;
+            for (int j = 0; j < boundaryEdges; ++j) {
+                mapped.outline.append(flatten(vertices[current]));
+                const auto &neighbors = boundary[current];
+                if (neighbors.size() != 2) { mapped.outline.clear(); break; }
+                const int next = neighbors[0] == previous ? neighbors[1] : neighbors[0];
+                previous = current; current = next;
+                if (current == start && j+1 != boundaryEdges) { mapped.outline.clear(); break; }
+            }
+            if (mapped.outline.size() != boundaryEdges || current != start) continue;
+            if (!sheet.parts.contains(face.part)) sheet.parts.append(face.part);
+            sheet.faces.append(std::move(mapped));
+        }
+        offset += high-low;
+    }
+    sheet.parts.sort();
     return sheet;
 }
 
@@ -485,58 +484,19 @@ bool InspectionMapEngine::load(const QString &root, QString *error) {
             if (!faceDrawing_.contains(faceId)) faceDrawing_.insert(faceId, i);
     QHash<QString, QVector<MapTriangle>> faceTriangles;
     for (const auto &triangle : triangles_) faceTriangles[triangle.faceId].append(triangle);
-    const QDir unrollRoot(source.filePath(QStringLiteral("unroll")));
-    if (unrollRoot.exists()) {
-        QDirIterator files(unrollRoot.path(), {QStringLiteral("*.dxf")}, QDir::Files);
-        QHash<QString, int> sheetIndex;
-        while (files.hasNext()) {
-            QHash<QString, QVector<QPointF>> blocks;
-            QVector<UnrollInsert> inserts;
-            QString ignored;
-            if (!readUnrollDxf(files.next(), &blocks, &inserts, &ignored)) continue;
-            for (const auto &insert : inserts) {
-                if (!blocks.contains(insert.block) || !faceTriangles.contains(insert.faceId)) continue;
-                UnrollFace face;
-                if (!makeUnrollFace(insert, blocks.value(insert.block), faceTriangles.value(insert.faceId), &face)) continue;
-                const QString side = insert.faceId.section(QLatin1Char('-'), 4, 4);
-                if (side != QStringLiteral("EX") && side != QStringLiteral("IN")) continue;
-                const QString series = face.partId.section(QLatin1Char('-'), 0, 2);
-                if (!face.partId.mid(series.size()).startsWith(QStringLiteral("-R"))) continue;
-                const QString id = series + QLatin1Char('|') + side;
-                if (!sheetIndex.contains(id)) {
-                    sheetIndex.insert(id, unrollSheets_.size());
-                    UnrollSheet sheet; sheet.id = id; sheet.series = series; sheet.side = side; sheet.sourceDxf = true;
-                    unrollSheets_.append(sheet);
-                }
-                auto &sheet = unrollSheets_[sheetIndex.value(id)];
-                if (!sheet.parts.contains(face.partId)) sheet.parts.append(face.partId);
-                sheet.faces.append(std::move(face));
-            }
-        }
-        const QStringList directions{QStringLiteral("FR"), QStringLiteral("RG"),
-                                     QStringLiteral("RR"), QStringLiteral("LF")};
-        for (auto &sheet : unrollSheets_) {
-            sheet.parts.sort();
-            double offset = 0;
-            for (const auto &direction : directions) {
-                double low = std::numeric_limits<double>::infinity(), high = -low;
-                for (const auto &face : sheet.faces) if (face.direction == direction)
-                    for (const auto &point : face.outline) {
-                        low = std::min(low, point.x()); high = std::max(high, point.x());
-                    }
-                if (!(high > low)) continue;
-                const double shift = offset - low;
-                for (auto &face : sheet.faces) if (face.direction == direction) {
-                    for (auto &point : face.outline) point.rx() += shift;
-                    for (auto &triangle : face.triangles) {
-                        triangle.a.rx() += shift; triangle.b.rx() += shift; triangle.c.rx() += shift;
-                    }
-                }
-                offset += high-low;
-            }
-        }
-        std::sort(unrollSheets_.begin(), unrollSheets_.end(), [](const auto &a, const auto &b) { return a.id < b.id; });
+    QMap<QString, QStringList> seriesParts;
+    for (const auto &part : parts()) {
+        const QString suffix = part.section(QLatin1Char('-'), -1);
+        bool isRange = suffix.startsWith(QLatin1Char('R')) && suffix.size() > 1;
+        for (const auto digit : suffix.mid(1)) isRange = isRange && digit.isDigit();
+        if (isRange)
+            seriesParts[part.left(part.size()-suffix.size()-1)].append(part);
     }
+    for (auto it = seriesParts.cbegin(); it != seriesParts.cend(); ++it)
+        for (const auto &side : {QStringLiteral("EX"), QStringLiteral("IN")}) {
+            auto sheet = generatedSeriesSheet(it.key(), side, it.value(), faceTriangles);
+            if (!sheet.faces.isEmpty()) unrollSheets_.append(std::move(sheet));
+        }
     const QStringList sides{QStringLiteral("EX"), QStringLiteral("IN"), QStringLiteral("GEN")};
     for (const auto &part : parts()) for (const auto &side : sides) {
         const bool covered = std::any_of(unrollSheets_.cbegin(), unrollSheets_.cend(), [&](const auto &sheet) {

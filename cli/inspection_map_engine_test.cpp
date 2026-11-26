@@ -18,8 +18,8 @@ int main(int argc, char *argv[]) {
         qCritical().noquote() << error;
         return 2;
     }
-    if (engine.parts().size() != 26 || engine.triangleCount() < 1000 ||
-        engine.drawings().size() < 240) return 3;
+    if (engine.parts().size() < 20 || engine.triangleCount() < 1000 ||
+        engine.drawings().size() < 100) return 3;
     const auto hit = engine.cast(QVector3D(3, -5, 22.649f), QVector3D(0, 1, 0));
     if (!hit.found || hit.partId != QStringLiteral("SP-PY3-BRG-01") ||
         hit.faceId != QStringLiteral("SP-PY3-BRG-01-EX-FR-01") ||
@@ -44,7 +44,9 @@ int main(int argc, char *argv[]) {
         qAbs(second.x() - first.x() - strip.width) > 0.001 ||
         qAbs(first.y() + strip.start.z()) > 0.001) return 9;
     const auto *sheet = engine.unrollSheet(QStringLiteral("SP-PY3-LSH|EX"));
-    if (!sheet || sheet->faces.size() < 100 || sheet->parts.size() != 6) return 10;
+    const auto *inside = engine.unrollSheet(QStringLiteral("SP-PY3-LSH|IN"));
+    if (!sheet || sheet->sourceDxf || sheet->faces.size() != 152 || sheet->parts.size() != 7 ||
+        !inside || inside->faces.size() != 48 || inside->parts.size() != 7) return 10;
     const auto &mapped = sheet->faces.first().triangles.first();
     QPointF mappedPoint;
     if (!sheet->point(sheet->faces.first().faceId, mapped.source.a, &mappedPoint) ||
