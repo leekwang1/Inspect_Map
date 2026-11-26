@@ -3,6 +3,7 @@
 #undef main
 
 #include <QTemporaryDir>
+#include <QSet>
 
 int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
@@ -82,6 +83,58 @@ int main(int argc, char *argv[]) {
     if (parts[1]->count() != 1 || scenes.first()->items().isEmpty()) return 14;
     const auto unrollTables = window.findChildren<QTableWidget *>();
     if (unrollTables.isEmpty()) return 42;
+    if (unrollTables.first()->selectionMode() != QAbstractItemView::ExtendedSelection) return 51;
+    auto *damageTable = unrollTables.first();
+    auto *unrollView = dynamic_cast<DrawingView *>(window.findChild<QGraphicsView *>());
+    if (!unrollView || damageTable->rowCount() < 2) return 53;
+    const QString firstId = damageTable->item(0, 0)->data(Qt::UserRole).toString();
+    const QString secondId = damageTable->item(1, 0)->data(Qt::UserRole).toString();
+    if (firstId.isEmpty() || secondId.isEmpty() || firstId == secondId) return 54;
+    for (int row : {0, 1})
+        damageTable->selectionModel()->select(damageTable->model()->index(row, 0),
+            QItemSelectionModel::Select | QItemSelectionModel::Rows);
+    if (damageTable->selectionModel()->selectedRows().size() != 2) return 55;
+    QSet<QString> highlighted;
+    QRectF area;
+    for (const auto *item : scenes.first()->items()) {
+        const auto *path = dynamic_cast<const QGraphicsPathItem *>(item);
+        if (!path || path->pen().color() != QColor(0, 141, 112)) continue;
+        const QString id = item->data(1).toString();
+        if (id == firstId || id == secondId) {
+            highlighted.insert(id);
+            const QRectF bounds = unrollView->viewportTransform().mapRect(item->sceneBoundingRect());
+            area = area.isNull() ? bounds : area.united(bounds);
+        }
+    }
+    if (highlighted.size() != 2 || !unrollView->areaPicked) return 56;
+    damageTable->clearSelection();
+    unrollView->areaPicked(area.adjusted(-4, -4, 4, 4).toAlignedRect());
+    QSet<QString> areaSelected;
+    for (const auto &index : damageTable->selectionModel()->selectedRows())
+        areaSelected.insert(damageTable->item(index.row(), 0)->data(Qt::UserRole).toString());
+    if (!areaSelected.contains(firstId) || !areaSelected.contains(secondId)) return 57;
+    QGraphicsScene probeScene;
+    QPainterPath separatedStrokes;
+    separatedStrokes.moveTo(0, 0); separatedStrokes.lineTo(0, 100);
+    separatedStrokes.moveTo(100, 0); separatedStrokes.lineTo(100, 100);
+    probeScene.addPath(separatedStrokes, QPen(Qt::red))->setData(1, QStringLiteral("probe"));
+    QGraphicsView probeView(&probeScene);
+    const QPoint emptyMiddle = probeView.mapFromScene(QPointF(50, 50));
+    if (!damageIdsInArea(&probeScene, &probeView, QRect(emptyMiddle-QPoint(5, 5), QSize(10, 10))).isEmpty())
+        return 58;
+    unrollView->areaPicked(QRect(-100, -100, 10, 10));
+    if (!damageTable->selectionModel()->selectedRows().isEmpty()) return 59;
+    damageTable->selectRow(0);
+    if (!unrollView->selectionCleared) return 60;
+    QMouseEvent rightClick(QEvent::MouseButtonPress, QPointF(10, 10),
+        Qt::RightButton, Qt::RightButton, Qt::NoModifier);
+    QApplication::sendEvent(unrollView->viewport(), &rightClick);
+    if (!damageTable->selectionModel()->selectedRows().isEmpty()) return 61;
+    QSet<QString> groupCommands;
+    for (const auto *button : window.findChildren<QPushButton *>()) groupCommands.insert(button->text());
+    if (!groupCommands.contains(QStringLiteral("동일 손상")) ||
+        !groupCommands.contains(QStringLiteral("이어짐")) ||
+        !groupCommands.contains(QStringLiteral("묶음 해제"))) return 52;
     if (unrollTables.first()->columnCount() != 7 ||
         unrollTables.first()->horizontalHeaderItem(2)->text() != QStringLiteral("폭(m)") ||
         unrollTables.first()->horizontalHeaderItem(4)->text() != QStringLiteral("두께(mm)") ||
@@ -196,45 +249,22 @@ int main(int argc, char *argv[]) {
     if (!InspectionMapWorkflow::active(dbPath, inspectionId, datasetId, &reviewed, &error)) return 28;
     for (const auto &item : reviewed.items) if (item.objectId == objectId &&
         !item.reviewState.isEmpty()) return 29;
-    const auto hit = engine.cast(QVector3D(3, -5, 22.649f), QVector3D(0, 1, 0));
-    const auto *target = engine.drawingForFace(hit.faceId);
-    if (!hit.found || !target) return 33;
-    QComboBox *partCombo = nullptr, *drawingCombo = nullptr, *faceCombo = nullptr;
-    for (auto *combo : window.findChildren<QComboBox *>()) {
-        if (combo->toolTip() == QStringLiteral("수동 교정 대상 부재")) partCombo = combo;
-        if (combo->toolTip() == QStringLiteral("수동 교정 대상 방향도")) drawingCombo = combo;
-        if (combo->toolTip() == QStringLiteral("손상이 놓인 모델 면")) faceCombo = combo;
-    }
-    if (!partCombo || !drawingCombo || !faceCombo) return 34;
-    if (partCombo->findData(hit.partId) < 0) return 39;
-    partCombo->setCurrentIndex(partCombo->findData(hit.partId));
-    if (drawingCombo->findData(target->id) < 0) return 40;
-    drawingCombo->setCurrentIndex(drawingCombo->findData(target->id));
-    if (faceCombo->findData(hit.faceId) < 0) return 41;
-    faceCombo->setCurrentIndex(faceCombo->findData(hit.faceId));
-    for (auto *combo : window.findChildren<QComboBox *>())
-        if (combo->findData(QStringLiteral("LINE")) >= 0)
-            combo->setCurrentIndex(combo->findData(QStringLiteral("LINE")));
-    QPushButton *start = nullptr, *confirm = nullptr;
+    QPushButton *defer = nullptr;
     for (auto *button : window.findChildren<QPushButton *>()) {
-        if (button->text() == QStringLiteral("도면에 점 찍기")) start = button;
-        if (button->text() == QStringLiteral("위치·물량 확정")) confirm = button;
+        if (button->text() == QStringLiteral("보류")) defer = button;
+        if (button->text() == QStringLiteral("도면에 점 찍기") ||
+            button->text() == QStringLiteral("위치·물량 확정")) return 33;
     }
-    const auto views = window.findChildren<QGraphicsView *>();
-    if (!start || !confirm || views.isEmpty()) return 35;
-    const QPointF flat = InspectionMapEngine::drawingPoint(*target, hit.point);
-    QVector3D secondPoint;
-    if (!engine.mapPoint(target->id, hit.faceId, flat+QPointF(0.1, 0), &secondPoint)) return 36;
-    start->click();
-    auto *drawingView = static_cast<DrawingView *>(views.first());
-    drawingView->pointPicked(flat);
-    drawingView->pointPicked(flat+QPointF(0.1, 0));
-    confirm->click();
-    if (!InspectionMapWorkflow::active(dbPath, inspectionId, datasetId, &reviewed, &error)) return 37;
-    bool corrected = false;
+    if (!defer) return 34;
+    defer->click();
+    if (!InspectionMapWorkflow::active(dbPath, inspectionId, datasetId, &reviewed, &error)) return 35;
+    bool deferred = false;
     for (const auto &item : reviewed.items) if (item.objectId == objectId)
-        corrected = item.status == QStringLiteral("PROJECTED") &&
-            item.reviewState == QStringLiteral("CORRECTED") && item.lengthMm > 0;
-    if (!corrected) return 38;
+        deferred = item.reviewState == QStringLiteral("DEFERRED");
+    if (!deferred) return 36;
+    reset->click();
+    if (!InspectionMapWorkflow::active(dbPath, inspectionId, datasetId, &reviewed, &error)) return 37;
+    for (const auto &item : reviewed.items) if (item.objectId == objectId &&
+        !item.reviewState.isEmpty()) return 38;
     return 0;
 }

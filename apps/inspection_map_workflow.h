@@ -4,6 +4,7 @@
 
 #include <QList>
 #include <QString>
+#include <QStringList>
 
 struct ProjectedDamage {
     QString objectId;
@@ -22,6 +23,10 @@ struct ProjectedDamage {
     double boxWidthMm = 0;
     double boxLengthMm = 0;
     double crackP90Mm = 0;
+    QString groupId;
+    QString groupKind;
+    QStringList sourceObjectIds;
+    QStringList sourceImageNames;
 };
 
 struct ProjectionBatch {
@@ -40,4 +45,8 @@ public:
     static bool review(const QString &projectDb, const QString &runId, const QString &objectId,
                        const InspectionMapEngine &engine,
                        const QString &decision, const ProjectedDamage *corrected, QString *error);
+    static bool group(const QString &projectDb, const QString &runId, const QStringList &objectIds,
+                      const QString &representativeId, const QString &kind, QString *error);
+    static bool ungroup(const QString &projectDb, const QString &runId,
+                        const QString &groupId, QString *error);
 };

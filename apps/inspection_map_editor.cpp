@@ -20,10 +20,13 @@
 #include <QMessageBox>
 #include <QPageSize>
 #include <QPainter>
+#include <QPainterPathStroker>
 #include <QPdfWriter>
 #include <QBuffer>
 #include <QImage>
 #include <QImageReader>
+#include <QInputDialog>
+#include <QItemSelectionModel>
 #include <QImageIOHandler>
 #include <QTransform>
 #include <QSaveFile>
@@ -40,6 +43,9 @@
 #include <QVBoxLayout>
 #include <QWheelEvent>
 #include <QMouseEvent>
+#include <QRubberBand>
+#include <QSet>
+#include <QSignalBlocker>
 #include <functional>
 #include <algorithm>
 #include <array>
@@ -47,14 +53,15 @@
 namespace {
 class DrawingView : public QGraphicsView {
 public:
-    bool capturePoints = false;
-    std::function<void(const QPointF &)> pointPicked;
+    std::function<void(const QRect &)> areaPicked;
+    std::function<void()> selectionCleared;
     explicit DrawingView(QWidget *parent = nullptr) : QGraphicsView(parent) {
         setRenderHint(QPainter::Antialiasing);
         setDragMode(QGraphicsView::ScrollHandDrag);
         setBackgroundBrush(QColor(248, 250, 250));
         setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        selectionBand_ = new QRubberBand(QRubberBand::Rectangle, viewport());
     }
     void fit() {
         if (scene() && !scene()->items().isEmpty())
@@ -62,10 +69,35 @@ public:
     }
 protected:
     void mousePressEvent(QMouseEvent *event) override {
-        if (capturePoints && pointPicked && event->button() == Qt::LeftButton) {
-            pointPicked(mapToScene(event->pos())); event->accept(); return;
+        if (event->button() == Qt::RightButton && selectionCleared) {
+            selectionCleared(); event->accept(); return;
+        }
+        if (event->button() == Qt::LeftButton &&
+            event->modifiers().testFlag(Qt::ControlModifier)) {
+            areaSelecting_ = true;
+            dragStart_ = event->pos();
+            selectionBand_->setGeometry(QRect(dragStart_, QSize()));
+            selectionBand_->show();
+            event->accept(); return;
         }
         QGraphicsView::mousePressEvent(event);
+    }
+    void mouseMoveEvent(QMouseEvent *event) override {
+        if (areaSelecting_) {
+            selectionBand_->setGeometry(QRect(dragStart_, event->pos()).normalized());
+            event->accept(); return;
+        }
+        QGraphicsView::mouseMoveEvent(event);
+    }
+    void mouseReleaseEvent(QMouseEvent *event) override {
+        if (areaSelecting_ && event->button() == Qt::LeftButton) {
+            const QRect area = QRect(dragStart_, event->pos()).normalized();
+            areaSelecting_ = false;
+            selectionBand_->hide();
+            if (area.width() >= 4 && area.height() >= 4 && areaPicked) areaPicked(area);
+            event->accept(); return;
+        }
+        QGraphicsView::mouseReleaseEvent(event);
     }
     void wheelEvent(QWheelEvent *event) override {
         const double factor = event->angleDelta().y() > 0 ? 1.15 : 1.0 / 1.15;
@@ -73,7 +105,28 @@ protected:
         scale(factor, factor);
         event->accept();
     }
+private:
+    QRubberBand *selectionBand_ = nullptr;
+    QPoint dragStart_;
+    bool areaSelecting_ = false;
 };
+
+QSet<QString> damageIdsInArea(const QGraphicsScene *scene, const QGraphicsView *view, const QRect &area) {
+    QSet<QString> hits;
+    QPainterPath selection;
+    selection.addRect(QRectF(area));
+    QPainterPathStroker stroker;
+    stroker.setWidth(8);
+    for (const auto *item : scene->items()) {
+        const auto *damagePath = dynamic_cast<const QGraphicsPathItem *>(item);
+        if (!damagePath) continue;
+        const QString id = item->data(1).toString();
+        if (id.isEmpty()) continue;
+        const QPainterPath visiblePath = view->viewportTransform().map(damagePath->mapToScene(damagePath->path()));
+        if (stroker.createStroke(visiblePath).intersects(selection)) hits.insert(id);
+    }
+    return hits;
+}
 
 QString statusLabel(const QString &status) {
     if (status == QStringLiteral("PROJECTED")) return QStringLiteral("투영 완료");
@@ -182,7 +235,7 @@ void addNumber(QGraphicsScene *scene, const QPointF &anchor, int number) {
 }
 
 void fillScene(QGraphicsScene *scene, const MapDrawing &drawing, const ProjectionBatch &batch,
-               const QString &selectedObject = {}) {
+               const QSet<QString> &selectedObjects = {}) {
     scene->clear();
     const auto numbered = numberedDamages(batch, drawing.partId);
     const QPen outline(QColor(86, 106, 116), 0);
@@ -199,7 +252,7 @@ void fillScene(QGraphicsScene *scene, const MapDrawing &drawing, const Projectio
         if (item.drawingId != drawing.id || item.paths.isEmpty() ||
             item.status == QStringLiteral("EXCLUDED")) continue;
         bool numberedHere = false;
-        const bool selected = item.objectId == selectedObject;
+        const bool selected = selectedObjects.contains(item.objectId);
         const QColor color = item.status == QStringLiteral("PROJECTED") ? QColor(196, 52, 49) : QColor(179, 132, 21);
         QPen pen(selected ? QColor(0, 141, 112) : color, selected ? 3.5 : 2);
         pen.setCosmetic(true);
@@ -213,6 +266,7 @@ void fillScene(QGraphicsScene *scene, const MapDrawing &drawing, const Projectio
             }
             if (line.size() == 1) path.addEllipse(path.currentPosition(), 0.015, 0.015);
             auto *drawn = scene->addPath(path, pen);
+            drawn->setData(1, item.objectId);
             drawn->setZValue(selected ? 2 : 1);
             drawn->setToolTip(item.imageName + QStringLiteral(" · ") + item.faceId +
                               QStringLiteral(" · ") + statusLabel(item.status));
@@ -238,7 +292,7 @@ QRectF drawingBounds(const MapDrawing &drawing) {
 
 void addDrawingAt(QGraphicsScene *scene, const MapDrawing &drawing, const ProjectionBatch &batch,
                   const QPointF &offset, const QVector<const ProjectedDamage *> &numbered,
-                  bool showDamage = true) {
+                  bool showDamage = true, const QSet<QString> &selectedObjects = {}) {
     const QPen outline(QColor(86, 106, 116), 0);
     for (const auto &line : drawing.lines) {
         QPainterPath path;
@@ -251,7 +305,9 @@ void addDrawingAt(QGraphicsScene *scene, const MapDrawing &drawing, const Projec
     if (!showDamage) return;
     for (const auto &damage : batch.items) {
         if (damage.drawingId != drawing.id || damage.status != QStringLiteral("PROJECTED")) continue;
-        QPen pen(QColor(196, 52, 49), 2); pen.setCosmetic(true);
+        const bool selected = selectedObjects.contains(damage.objectId);
+        QPen pen(selected ? QColor(0, 141, 112) : QColor(196, 52, 49), selected ? 3.5 : 2);
+        pen.setCosmetic(true);
         bool numberedHere = false;
         for (const auto &line : damage.paths) {
             QPainterPath path;
@@ -260,7 +316,9 @@ void addDrawingAt(QGraphicsScene *scene, const MapDrawing &drawing, const Projec
                 if (i == 0) path.moveTo(point); else path.lineTo(point);
             }
             if (line.size() == 1) path.addEllipse(path.currentPosition(), 0.015, 0.015);
-            scene->addPath(path, pen)->setZValue(2);
+            auto *drawn = scene->addPath(path, pen);
+            drawn->setData(1, damage.objectId);
+            drawn->setZValue(selected ? 3 : 2);
             if (!numberedHere && !line.isEmpty()) {
                 addNumber(scene, InspectionMapEngine::drawingPoint(drawing, line.first()) + offset,
                           damageNumber(numbered, damage));
@@ -287,7 +345,7 @@ int directionRank(const MapDrawing &drawing) {
 }
 
 void fillMapSheetScene(QGraphicsScene *scene, const QString &part, const InspectionMapEngine &engine,
-                       const ProjectionBatch &batch) {
+                       const ProjectionBatch &batch, const QSet<QString> &selectedObjects = {}) {
     scene->clear();
     const auto numbered = numberedDamages(batch, part);
     QHash<QString, QVector<const MapDrawing *>> groups;
@@ -317,7 +375,8 @@ void fillMapSheetScene(QGraphicsScene *scene, const QString &part, const Inspect
             auto *label = scene->addText(drawing->id.mid(part.size() + 1));
             label->setDefaultTextColor(QColor(43, 70, 80)); label->setScale(0.019);
             label->setPos(x, y);
-            addDrawingAt(scene, *drawing, batch, QPointF(x-bounds.left(), y+0.36-bounds.top()), numbered);
+            addDrawingAt(scene, *drawing, batch, QPointF(x-bounds.left(), y+0.36-bounds.top()),
+                         numbered, true, selectedObjects);
             x += bounds.width()+0.6;
             rowHeight = std::max(rowHeight, bounds.height());
         }
@@ -347,7 +406,8 @@ QPointF verifiedUnrollOffset(const UnrollSheet &sheet, const InspectionMapEngine
 }
 
 void fillVerifiedUnrollScene(QGraphicsScene *scene, const UnrollSheet &sheet,
-                             const InspectionMapEngine &engine, const ProjectionBatch &batch) {
+                             const InspectionMapEngine &engine, const ProjectionBatch &batch,
+                             const QSet<QString> &selectedObjects = {}) {
     scene->clear();
     const auto numbered = numberedDamages(batch, {}, &sheet);
     QRectF referenceBounds;
@@ -372,7 +432,9 @@ void fillVerifiedUnrollScene(QGraphicsScene *scene, const UnrollSheet &sheet,
     }
     for (const auto &damage : batch.items) {
         if (damage.status != QStringLiteral("PROJECTED") || !sheet.parts.contains(damage.partId)) continue;
-        QPen pen(QColor(197, 48, 45), 2); pen.setCosmetic(true);
+        const bool selected = selectedObjects.contains(damage.objectId);
+        QPen pen(selected ? QColor(0, 141, 112) : QColor(197, 48, 45), selected ? 3.5 : 2);
+        pen.setCosmetic(true);
         bool numberedHere = false;
         for (const auto &line : damage.paths) {
             QPainterPath path; bool valid = true;
@@ -384,7 +446,9 @@ void fillVerifiedUnrollScene(QGraphicsScene *scene, const UnrollSheet &sheet,
             }
             if (valid && !line.isEmpty()) {
                 if (line.size() == 1) path.addEllipse(path.currentPosition(), 0.015, 0.015);
-                scene->addPath(path, pen)->setZValue(2);
+                auto *drawn = scene->addPath(path, pen);
+                drawn->setData(1, damage.objectId);
+                drawn->setZValue(selected ? 3 : 2);
                 if (!numberedHere) {
                     QPointF point;
                     if (sheet.point(damage.faceId, line.first(), &point))
@@ -648,7 +712,8 @@ public:
         centerLayout->addLayout(viewBar);
         scene_ = new QGraphicsScene(this);
         view_ = new DrawingView;
-        view_->pointPicked = [this](const QPointF &point) { addReviewPoint(point); };
+        view_->areaPicked = [this](const QRect &area) { selectDamageInArea(area); };
+        view_->selectionCleared = [this] { clearDamageSelection(); };
         view_->setScene(scene_);
         centerLayout->addWidget(view_, 1);
         split->addWidget(center);
@@ -667,9 +732,10 @@ public:
         items_->horizontalHeader()->setStretchLastSection(true);
         items_->verticalHeader()->hide();
         items_->setSelectionBehavior(QAbstractItemView::SelectRows);
+        items_->setSelectionMode(QAbstractItemView::ExtendedSelection);
         items_->setEditTriggers(QAbstractItemView::NoEditTriggers);
         connect(items_, &QTableWidget::itemSelectionChanged, this, [this] {
-            if (!capture_ && items_->currentRow() >= 0 && items_->item(items_->currentRow(), 0)) {
+            if (items_->currentRow() >= 0 && items_->item(items_->currentRow(), 0)) {
                 reviewObjectId_ = items_->item(items_->currentRow(), 0)->data(Qt::UserRole).toString();
                 updateReviewInfo();
             }
@@ -721,35 +787,24 @@ public:
         auto *quantityNote = new QLabel(QStringLiteral("* 두께는 영상 추정치이며 실측 개구폭이 아닙니다."));
         quantityNote->setWordWrap(true);
         rightLayout->addWidget(quantityNote);
-        auto *reviewBox = new QGroupBox(QStringLiteral("투영 검토"));
+        auto *groupBox = new QGroupBox(QStringLiteral("손상 묶기"));
+        auto *groupLayout = new QHBoxLayout(groupBox);
+        auto *duplicate = new QPushButton(QStringLiteral("동일 손상"));
+        duplicate->setToolTip(QStringLiteral("여러 영상의 같은 손상을 대표 한 건으로 표시"));
+        connect(duplicate, &QPushButton::clicked, this, [this] { groupSelected(QStringLiteral("DUPLICATE")); });
+        groupLayout->addWidget(duplicate);
+        auto *connected = new QPushButton(QStringLiteral("이어짐"));
+        connected->setToolTip(QStringLiteral("선택한 균열 조각의 원래 선을 유지하고 한 건으로 묶기"));
+        connect(connected, &QPushButton::clicked, this, [this] { groupSelected(QStringLiteral("CONNECTED")); });
+        groupLayout->addWidget(connected);
+        auto *ungroup = new QPushButton(QStringLiteral("묶음 해제"));
+        connect(ungroup, &QPushButton::clicked, this, [this] { ungroupSelected(); });
+        groupLayout->addWidget(ungroup);
+        rightLayout->addWidget(groupBox);
+        auto *reviewBox = new QGroupBox(QStringLiteral("투영 판정"));
         auto *reviewLayout = new QVBoxLayout(reviewBox);
         reviewInfo_ = new QLabel(QStringLiteral("손상을 선택하십시오."));
         reviewInfo_->setWordWrap(true); reviewInfo_->setMinimumHeight(76); reviewLayout->addWidget(reviewInfo_);
-        reviewPart_ = new QComboBox; reviewPart_->setToolTip(QStringLiteral("수동 교정 대상 부재"));
-        reviewDrawing_ = new QComboBox; reviewDrawing_->setToolTip(QStringLiteral("수동 교정 대상 방향도"));
-        reviewFace_ = new QComboBox; reviewFace_->setToolTip(QStringLiteral("손상이 놓인 모델 면"));
-        reviewLayout->addWidget(reviewPart_); reviewLayout->addWidget(reviewDrawing_);
-        reviewLayout->addWidget(reviewFace_);
-        connect(reviewPart_, &QComboBox::currentIndexChanged, this, [this] { updateReviewDrawings(); });
-        connect(reviewDrawing_, &QComboBox::currentIndexChanged, this, [this] { updateReviewFaces(); });
-        traceKind_ = new QComboBox;
-        traceKind_->addItem(QStringLiteral("균열선 · 길이"), QStringLiteral("LINE"));
-        traceKind_->addItem(QStringLiteral("영역 · 면적"), QStringLiteral("AREA"));
-        reviewLayout->addWidget(traceKind_);
-        auto *traceRow = new QHBoxLayout;
-        auto *traceStart = new QPushButton(QStringLiteral("도면에 점 찍기"));
-        connect(traceStart, &QPushButton::clicked, this, [this] { startReviewTrace(); });
-        traceRow->addWidget(traceStart);
-        auto *traceUndo = new QPushButton(QStringLiteral("↶"));
-        traceUndo->setToolTip(QStringLiteral("마지막 점 취소"));
-        connect(traceUndo, &QPushButton::clicked, this, [this] {
-            if (!tracePoints_.isEmpty()) tracePoints_.removeLast(); refreshView(false);
-        });
-        traceRow->addWidget(traceUndo); reviewLayout->addLayout(traceRow);
-        traceCount_ = new QLabel(QStringLiteral("점 0개")); reviewLayout->addWidget(traceCount_);
-        auto *confirm = new QPushButton(QStringLiteral("위치·물량 확정"));
-        connect(confirm, &QPushButton::clicked, this, [this] { confirmReviewTrace(); });
-        reviewLayout->addWidget(confirm);
         auto *decisionRow = new QHBoxLayout;
         for (const auto &command : {QStringLiteral("제외"), QStringLiteral("보류"), QStringLiteral("되돌리기")}) {
             auto *button = new QPushButton(command);
@@ -778,7 +833,7 @@ public:
             "QMainWindow,QWidget { background:#f4f7f8; color:#173044; font-size:14px; }"
             "QLabel#title { background:#243b4e; color:white; font-size:22px; font-weight:700; padding:18px 22px; }"
             "QListWidget,QTableWidget,QGraphicsView { background:white; border:1px solid #cbd6db; }"
-            "QListWidget::item:selected,QTableWidget::item:selected { background:#dcefeb; color:#143b34; }"
+            "QListWidget::item:selected,QTableWidget::item:selected { background:#b8e9dc; color:#143b34; }"
             "QPushButton,QComboBox { background:white; border:1px solid #b9cbd0; padding:7px 12px; }"
             "QPushButton:hover { background:#e6f2ef; }"
             "QPushButton#primary { background:#137c70; color:white; border-color:#137c70; }"));
@@ -829,9 +884,6 @@ private:
         if (auto *model = qobject_cast<QStandardItemModel *>(mode_->model()))
             model->item(1)->setEnabled(!engine_.unrollSheets().isEmpty());
         if (engine_.unrollSheets().isEmpty() && isUnroll()) mode_->setCurrentIndex(0);
-        reviewPart_->blockSignals(true); reviewPart_->clear();
-        for (const auto &part : engine_.parts()) reviewPart_->addItem(part, part);
-        reviewPart_->blockSignals(false); updateReviewDrawings();
         QList<DamageDataset> datasets;
         if (!DamageStore::datasets(projectDb_, inspectionId_, &datasets, &error)) {
             QMessageBox::warning(this, QStringLiteral("데이터 세트 읽기 실패"), error); return false;
@@ -857,20 +909,52 @@ private:
         updateReviewInfo();
     }
 
-    void updateReviewDrawings() {
-        reviewDrawing_->blockSignals(true); reviewDrawing_->clear();
-        for (const auto &drawing : engine_.drawings())
-            if (drawing.partId == reviewPart_->currentData().toString())
-                reviewDrawing_->addItem(drawing.id, drawing.id);
-        reviewDrawing_->blockSignals(false); updateReviewFaces();
+    void groupSelected(const QString &kind) {
+        if (!items_->selectionModel()) return;
+        QStringList ids, labels;
+        for (const auto &index : items_->selectionModel()->selectedRows()) {
+            const auto *cell = items_->item(index.row(), 0);
+            if (!cell) continue;
+            const QString id = cell->data(Qt::UserRole).toString();
+            const auto found = std::find_if(batch_.items.cbegin(), batch_.items.cend(),
+                [&](const auto &item) { return item.objectId == id; });
+            if (found == batch_.items.cend()) continue;
+            ids.append(id);
+            labels.append(QStringLiteral("%1 · %2").arg(found->imageName, id.left(8)));
+        }
+        if (ids.size() < 2) {
+            QMessageBox::information(this, QStringLiteral("손상 선택"),
+                QStringLiteral("Ctrl 또는 Shift로 손상을 두 건 이상 선택하십시오.")); return;
+        }
+        bool chosen = false;
+        const QString label = QInputDialog::getItem(this, QStringLiteral("대표 손상 선택"),
+            kind == QStringLiteral("CONNECTED") ?
+                QStringLiteral("묶음의 대표 번호로 사용할 균열을 선택하십시오. 원래 선은 모두 유지됩니다.") :
+                QStringLiteral("망도에 표시할 대표 영상의 손상을 선택하십시오."),
+            labels, 0, false, &chosen);
+        if (!chosen) return;
+        const QString representative = ids[labels.indexOf(label)];
+        QString error;
+        if (!InspectionMapWorkflow::group(projectDb_, batch_.runId, ids, representative, kind, &error)) {
+            QMessageBox::warning(this, QStringLiteral("손상 묶기 실패"), error); return;
+        }
+        reviewObjectId_ = representative;
+        loadBatch();
+        statusBar()->showMessage(QStringLiteral("원본 %1건을 최종 손상 한 건으로 묶었습니다.").arg(ids.size()), 6000);
     }
 
-    void updateReviewFaces() {
-        reviewFace_->clear();
-        const auto *drawing = engine_.drawing(reviewDrawing_->currentData().toString());
-        if (!drawing) return;
-        QStringList faces = drawing->faceIds.values(); faces.sort();
-        for (const auto &face : faces) reviewFace_->addItem(face, face);
+    void ungroupSelected() {
+        const auto *item = reviewItem();
+        if (!item || item->groupId.isEmpty()) {
+            QMessageBox::information(this, QStringLiteral("묶음 선택"),
+                QStringLiteral("묶인 대표 손상을 선택하십시오.")); return;
+        }
+        QString error;
+        if (!InspectionMapWorkflow::ungroup(projectDb_, batch_.runId, item->groupId, &error)) {
+            QMessageBox::warning(this, QStringLiteral("묶음 해제 실패"), error); return;
+        }
+        loadBatch();
+        statusBar()->showMessage(QStringLiteral("묶음을 해제했습니다. 수동으로 그린 최종 선은 되돌리기로 초기화할 수 있습니다."), 6000);
     }
 
     const ProjectedDamage *reviewItem() const {
@@ -886,13 +970,15 @@ private:
                  item->reviewState.isEmpty() ? QStringLiteral("미검토") :
                  item->reviewState == QStringLiteral("EXCLUDED") ? QStringLiteral("제외") :
                  item->reviewState == QStringLiteral("DEFERRED") ? QStringLiteral("보류") : QStringLiteral("수동 확정")));
-        const int partIndex = reviewPart_->findData(item->partId);
-        if (partIndex >= 0) reviewPart_->setCurrentIndex(partIndex);
-        const int drawingIndex = reviewDrawing_->findData(item->drawingId);
-        if (drawingIndex >= 0) reviewDrawing_->setCurrentIndex(drawingIndex);
-        const int faceIndex = reviewFace_->findData(item->faceId);
-        if (faceIndex >= 0) reviewFace_->setCurrentIndex(faceIndex);
-        traceKind_->setCurrentIndex(item->type == QStringLiteral("crack") ? 0 : 1);
+        if (!item->groupId.isEmpty()) {
+            QStringList images;
+            for (const auto &name : item->sourceImageNames)
+                if (!images.contains(name)) images.append(name);
+            reviewInfo_->setText(reviewInfo_->text() + QStringLiteral("\n%1 · 원본 객체 %2건 · 영상 %3")
+                .arg(item->groupKind == QStringLiteral("CONNECTED") ? QStringLiteral("이어진 손상") :
+                     QStringLiteral("중복 관측"))
+                .arg(item->sourceObjectIds.size()).arg(images.join(QStringLiteral(", "))));
+        }
         showReviewImage(*item);
     }
 
@@ -955,89 +1041,16 @@ private:
         else view_->fit();
     }
 
-    void startReviewTrace() {
-        if (!reviewItem()) {
-            QMessageBox::information(this, QStringLiteral("손상 선택"), QStringLiteral("검토할 손상을 먼저 선택하십시오.")); return;
-        }
-        const QString part = reviewPart_->currentData().toString();
-        const QString drawing = reviewDrawing_->currentData().toString();
-        if (part.isEmpty() || drawing.isEmpty() || reviewFace_->currentData().toString().isEmpty()) {
-            QMessageBox::information(this, QStringLiteral("대상 지정"), QStringLiteral("부재·도면·면을 선택하십시오.")); return;
-        }
-        capture_ = true; view_->capturePoints = true; tracePoints_.clear();
-        if (isUnroll()) mode_->setCurrentIndex(0);
-        for (int i = 0; i < parts_->count(); ++i) if (parts_->item(i)->data(Qt::UserRole) == part) {
-            parts_->setCurrentRow(i); break;
-        }
-        for (int i = 0; i < drawings_->count(); ++i) if (drawings_->item(i)->data(Qt::UserRole) == drawing) {
-            drawings_->setCurrentRow(i); break;
-        }
-        traceCount_->setText(QStringLiteral("도면에서 점을 찍으십시오 · 점 0개"));
-    }
-
-    void addReviewPoint(const QPointF &point) {
-        if (!capture_) return;
-        const QString drawing = reviewDrawing_->currentData().toString();
-        const QString face = reviewFace_->currentData().toString();
-        if (!drawings_->currentItem() || drawings_->currentItem()->data(Qt::UserRole).toString() != drawing) return;
-        QVector3D world;
-        if (!engine_.mapPoint(drawing, face, point, &world)) {
-            statusBar()->showMessage(QStringLiteral("선택한 모델 면 안의 점을 지정하십시오."), 4000); return;
-        }
-        tracePoints_.append(world);
-        traceCount_->setText(QStringLiteral("점 %1개 · %2").arg(tracePoints_.size()).arg(face));
-        refreshView(false);
-    }
-
-    void drawReviewTrace(const MapDrawing &drawing) {
-        if (!capture_ || drawing.id != reviewDrawing_->currentData().toString()) return;
-        QPainterPath path;
-        for (int i = 0; i < tracePoints_.size(); ++i) {
-            const QPointF point = InspectionMapEngine::drawingPoint(drawing, tracePoints_[i]);
-            if (i == 0) path.moveTo(point); else path.lineTo(point);
-            scene_->addEllipse(QRectF(point.x()-0.08, point.y()-0.08, 0.16, 0.16),
-                               QPen(QColor(0, 120, 95), 0), QBrush(Qt::white))->setZValue(10);
-        }
-        scene_->addPath(path, QPen(QColor(0, 120, 95), 2, Qt::DashLine))->setZValue(9);
-    }
-
-    void saveReviewDecision(const QString &decision, const ProjectedDamage *corrected = nullptr) {
+    void saveReviewDecision(const QString &decision) {
         if (!reviewItem()) {
             QMessageBox::information(this, QStringLiteral("손상 선택"), QStringLiteral("검토할 손상을 먼저 선택하십시오.")); return;
         }
         QString error;
-        if (!InspectionMapWorkflow::review(projectDb_, batch_.runId, reviewObjectId_, engine_, decision, corrected, &error)) {
+        if (!InspectionMapWorkflow::review(projectDb_, batch_.runId, reviewObjectId_, engine_, decision, nullptr, &error)) {
             QMessageBox::warning(this, QStringLiteral("검토 저장 실패"), error); return;
         }
-        capture_ = false; view_->capturePoints = false; tracePoints_.clear();
-        traceCount_->setText(QStringLiteral("점 0개"));
         loadBatch();
         statusBar()->showMessage(QStringLiteral("검토 판정을 저장했습니다."), 5000);
-    }
-
-    void confirmReviewTrace() {
-        const bool area = traceKind_->currentData().toString() == QStringLiteral("AREA");
-        if (!capture_ || tracePoints_.size() < (area ? 3 : 2) || !reviewItem()) {
-            QMessageBox::information(this, QStringLiteral("형상 필요"),
-                area ? QStringLiteral("영역의 점을 3개 이상 찍으십시오.") : QStringLiteral("선의 점을 2개 이상 찍으십시오."));
-            return;
-        }
-        ProjectedDamage corrected = *reviewItem();
-        corrected.partId = reviewPart_->currentData().toString();
-        corrected.drawingId = reviewDrawing_->currentData().toString();
-        corrected.faceId = reviewFace_->currentData().toString();
-        corrected.paths = {tracePoints_}; corrected.lengthMm = 0; corrected.areaMm2 = 0;
-        if (area) {
-            QVector3D cross;
-            for (int i = 0; i < tracePoints_.size(); ++i)
-                cross += QVector3D::crossProduct(tracePoints_[i], tracePoints_[(i+1)%tracePoints_.size()]);
-            corrected.areaMm2 = 500000.0 * double(cross.length());
-        } else for (int i = 1; i < tracePoints_.size(); ++i)
-            corrected.lengthMm += 1000.0 * double((tracePoints_[i]-tracePoints_[i-1]).length());
-        if (corrected.lengthMm <= 0 && corrected.areaMm2 <= 0) {
-            QMessageBox::warning(this, QStringLiteral("물량 계산 불가"), QStringLiteral("점들이 중복되거나 영역이 유효하지 않습니다.")); return;
-        }
-        saveReviewDecision(QStringLiteral("CORRECTED"), &corrected);
     }
 
     void runProjection(bool notify = true) {
@@ -1045,6 +1058,11 @@ private:
             QMessageBox::information(this, QStringLiteral("데이터 세트 필요"),
                 QStringLiteral("손상 결과가 등록된 데이터 세트를 선택하십시오.")); return;
         }
+        if (std::any_of(batch_.items.cbegin(), batch_.items.cend(),
+                        [](const auto &item) { return !item.groupId.isEmpty(); }) &&
+            QMessageBox::question(this, QStringLiteral("수동 묶음 재검토"),
+                QStringLiteral("3D 투영을 다시 실행하면 현재 손상 묶음은 새 결과에 적용되지 않습니다. 계속하시겠습니까?"))
+                != QMessageBox::Yes) return;
         QString error;
         QApplication::setOverrideCursor(Qt::WaitCursor);
         ProjectionBatch next;
@@ -1201,16 +1219,59 @@ private:
             items_->setItem(row, 3, new QTableWidgetItem(metreLabel(measured ? item.boxLengthMm : 0)));
             items_->setItem(row, 4, new QTableWidgetItem(dimensionLabel(measured ? item.crackP90Mm : 0)));
             items_->setItem(row, 5, new QTableWidgetItem(item.imageName));
-            const QString note = excluded ? QStringLiteral("전개 제외") :
+            const QString note = !item.groupId.isEmpty() ?
+                QStringLiteral("%1 · 원본 %2건").arg(item.groupKind == QStringLiteral("CONNECTED") ?
+                    QStringLiteral("이어짐") : QStringLiteral("동일 손상")).arg(item.sourceObjectIds.size()) :
+                excluded ? QStringLiteral("전개 제외") :
                 item.reviewState == QStringLiteral("DEFERRED") ? QStringLiteral("보류") : statusLabel(item.status);
             items_->setItem(row, 6, new QTableWidgetItem(note));
             for (int col = 0; col < 7; ++col) {
                 items_->item(row, col)->setData(Qt::UserRole, item.objectId);
                 items_->item(row, col)->setToolTip(item.imageName + QStringLiteral("\n") +
-                    item.faceId + QStringLiteral("\n") + item.reason);
+                    item.faceId + QStringLiteral("\n") + item.reason +
+                    (item.sourceImageNames.isEmpty() ? QString() :
+                     QStringLiteral("\n근거 영상: ") + item.sourceImageNames.join(QStringLiteral(", "))));
             }
         }
         items_->blockSignals(false);
+    }
+
+    QSet<QString> selectedDamageIds() const {
+        QSet<QString> ids;
+        for (const auto &index : items_->selectionModel()->selectedRows())
+            if (auto *cell = items_->item(index.row(), 0))
+                ids.insert(cell->data(Qt::UserRole).toString());
+        return ids;
+    }
+
+    void clearDamageSelection() {
+        reviewObjectId_.clear();
+        items_->clearSelection();
+        updateReviewInfo();
+        refreshView(false);
+    }
+
+    void selectDamageInArea(const QRect &area) {
+        const QSet<QString> hits = damageIdsInArea(scene_, view_, area);
+        if (hits.isEmpty()) { clearDamageSelection(); return; }
+        int matched = 0;
+        {
+            const QSignalBlocker blocker(items_);
+            for (int row = 0; row < items_->rowCount(); ++row) {
+                auto *cell = items_->item(row, 0);
+                if (!cell || !hits.contains(cell->data(Qt::UserRole).toString())) continue;
+                items_->selectionModel()->select(items_->model()->index(row, 0),
+                    QItemSelectionModel::Select | QItemSelectionModel::Rows);
+                reviewObjectId_ = cell->data(Qt::UserRole).toString();
+                ++matched;
+            }
+        }
+        if (matched > 0) {
+            updateReviewInfo();
+            refreshView(false);
+            statusBar()->showMessage(QStringLiteral("손상 %1건 선택 · 총 %2건 선택")
+                .arg(matched).arg(selectedDamageIds().size()), 4000);
+        }
     }
 
     void refreshView(bool fit = true) {
@@ -1232,17 +1293,14 @@ private:
                 .arg(sheet->series, sideName).arg(sheet->parts.size()).arg(sheet->faces.size())
                 .arg(excludedDamage).arg(sheet->sourceDxf ? QStringLiteral("기준 DXF") : QStringLiteral("모델 자동 생성")));
             if (fit) fillItems(id);
-            const QString selected = items_->currentRow() >= 0 && items_->item(items_->currentRow(), 0) ?
-                items_->item(items_->currentRow(), 0)->data(Qt::UserRole).toString() : QString();
-            Q_UNUSED(selected);
-            fillVerifiedUnrollScene(scene_, *sheet, engine_, batch_);
+            fillVerifiedUnrollScene(scene_, *sheet, engine_, batch_, selectedDamageIds());
             if (fit) view_->fit();
             return;
         }
         if (id == QStringLiteral("__MAP_SHEET__")) {
             drawingTitle_->setText(currentPart() + QStringLiteral(" · 방향도 전체 배치"));
             if (fit) fillItems(id);
-            fillMapSheetScene(scene_, currentPart(), engine_, batch_);
+            fillMapSheetScene(scene_, currentPart(), engine_, batch_, selectedDamageIds());
             if (fit) view_->fit();
             return;
         }
@@ -1250,10 +1308,7 @@ private:
         if (!drawing) { scene_->clear(); items_->setRowCount(0); return; }
         drawingTitle_->setText(drawing->id);
         if (fit) fillItems(drawing->id);
-        const QString selected = items_->currentRow() >= 0 && items_->item(items_->currentRow(), 0) ?
-            items_->item(items_->currentRow(), 0)->data(Qt::UserRole).toString() : QString();
-        fillScene(scene_, *drawing, batch_, selected);
-        drawReviewTrace(*drawing);
+        fillScene(scene_, *drawing, batch_, selectedDamageIds());
         if (fit) view_->fit();
     }
 
@@ -1387,14 +1442,11 @@ private:
 
     QString projectDb_, inspectionId_;
     QString reviewObjectId_;
-    QVector<QVector3D> tracePoints_;
-    bool capture_ = false;
     InspectionMapEngine engine_;
     ProjectionBatch batch_;
     QLabel *projectLabel_ = nullptr, *drawingTitle_ = nullptr, *summary_ = nullptr;
     QComboBox *dataset_ = nullptr, *mode_ = nullptr;
-    QComboBox *reviewPart_ = nullptr, *reviewDrawing_ = nullptr, *reviewFace_ = nullptr, *traceKind_ = nullptr;
-    QLabel *reviewInfo_ = nullptr, *traceCount_ = nullptr;
+    QLabel *reviewInfo_ = nullptr;
     QListWidget *parts_ = nullptr, *drawings_ = nullptr;
     QTableWidget *items_ = nullptr;
     QGraphicsScene *scene_ = nullptr;

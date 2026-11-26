@@ -8,6 +8,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QQuaternion>
+#include <QSet>
 #include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
@@ -367,7 +368,15 @@ bool InspectionMapWorkflow::ensureSchema(const QString &projectDb, QString *erro
                 "decision TEXT NOT NULL, part_id TEXT NOT NULL DEFAULT '', face_id TEXT NOT NULL DEFAULT '', "
                 "drawing_id TEXT NOT NULL DEFAULT '', paths_json TEXT NOT NULL DEFAULT '[]', "
                 "length_mm REAL NOT NULL DEFAULT 0, area_mm2 REAL NOT NULL DEFAULT 0, "
-                "updated_at TEXT NOT NULL, PRIMARY KEY(run_id,object_id))")
+                "updated_at TEXT NOT NULL, PRIMARY KEY(run_id,object_id))"),
+            QStringLiteral("CREATE TABLE IF NOT EXISTS map_damage_group ("
+                "group_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES map_projection_run(run_id), "
+                "kind TEXT NOT NULL CHECK(kind IN ('DUPLICATE','CONNECTED')), "
+                "representative_id TEXT NOT NULL, created_at TEXT NOT NULL)"),
+            QStringLiteral("CREATE TABLE IF NOT EXISTS map_damage_group_member ("
+                "group_id TEXT NOT NULL REFERENCES map_damage_group(group_id), "
+                "run_id TEXT NOT NULL, object_id TEXT NOT NULL, "
+                "PRIMARY KEY(run_id,object_id))")
         };
         for (const auto &statement : statements) if (!query.exec(statement)) {
             if (error) *error = query.lastError().text(); return false;
@@ -509,13 +518,62 @@ bool InspectionMapWorkflow::active(const QString &projectDb, const QString &insp
                 item.drawingId = reviews.value(4).toString();
                 item.paths = readPaths(reviews.value(5).toByteArray());
                 item.lengthMm = reviews.value(6).toDouble(); item.areaMm2 = reviews.value(7).toDouble();
-                item.boxWidthMm = 0; item.boxLengthMm = 0;
+                if (item.lengthMm > 0) item.boxLengthMm = item.lengthMm;
                 item.status = QStringLiteral("PROJECTED"); item.reason = QStringLiteral("수동 위치·물량 확정");
             } else if (item.reviewState == QStringLiteral("EXCLUDED")) {
                 item.status = QStringLiteral("EXCLUDED"); item.reason = QStringLiteral("망도 검토 제외");
                 item.lengthMm = 0; item.areaMm2 = 0;
             }
         }
+        reviews.finish();
+        QSet<QString> hidden;
+        QHash<QString, QStringList> connectedMembers;
+        QSqlQuery members(db);
+        members.prepare(QStringLiteral("SELECT g.group_id,g.kind,g.representative_id,m.object_id "
+            "FROM map_damage_group g JOIN map_damage_group_member m ON m.group_id=g.group_id "
+            "WHERE g.run_id=? ORDER BY g.group_id,m.object_id"));
+        members.addBindValue(batch->runId);
+        if (!exec(members, error)) return false;
+        while (members.next()) {
+            const QString representativeId = members.value(2).toString();
+            const QString objectId = members.value(3).toString();
+            const int representative = byObject.value(representativeId, -1);
+            const int source = byObject.value(objectId, -1);
+            if (representative < 0 || source < 0) continue;
+            auto &item = batch->items[representative];
+            item.groupId = members.value(0).toString();
+            item.groupKind = members.value(1).toString();
+            item.sourceObjectIds.append(objectId);
+            item.sourceImageNames.append(batch->items[source].imageName);
+            if (item.groupKind == QStringLiteral("CONNECTED"))
+                connectedMembers[representativeId].append(objectId);
+            if (objectId != representativeId) hidden.insert(objectId);
+        }
+        members.finish();
+        for (auto it = connectedMembers.cbegin(); it != connectedMembers.cend(); ++it) {
+            const int representative = byObject.value(it.key(), -1);
+            if (representative < 0) continue;
+            QVector<QVector<QVector3D>> paths;
+            double lengthMm = 0, boxLengthMm = 0, boxWidthMm = 0, crackP90Mm = 0;
+            for (const auto &id : it.value()) {
+                const int source = byObject.value(id, -1);
+                if (source < 0) continue;
+                const auto &member = batch->items[source];
+                paths += member.paths;
+                lengthMm += member.lengthMm;
+                boxLengthMm += member.boxLengthMm;
+                boxWidthMm = std::max(boxWidthMm, member.boxWidthMm);
+                crackP90Mm = std::max(crackP90Mm, member.crackP90Mm);
+            }
+            auto &item = batch->items[representative];
+            item.paths = std::move(paths);
+            item.lengthMm = lengthMm;
+            item.boxLengthMm = boxLengthMm;
+            item.boxWidthMm = boxWidthMm;
+            item.crackP90Mm = crackP90Mm;
+        }
+        for (int i = batch->items.size()-1; i >= 0; --i)
+            if (hidden.contains(batch->items[i].objectId)) batch->items.removeAt(i);
         return true;
     });
 }
@@ -578,6 +636,15 @@ bool InspectionMapWorkflow::review(const QString &projectDb, const QString &runI
         if (!exec(exists, error)) return false;
         if (!exists.next()) { if (error) *error = QStringLiteral("현재 실행의 손상이 아닙니다."); return false; }
         exists.finish();
+        QSqlQuery grouped(db);
+        grouped.prepare(QStringLiteral("SELECT 1 FROM map_damage_group_member WHERE run_id=? AND object_id=?"));
+        grouped.addBindValue(runId); grouped.addBindValue(objectId);
+        if (!exec(grouped, error)) return false;
+        if (grouped.next()) {
+            if (error) *error = QStringLiteral("먼저 손상 묶음을 해제한 뒤 수정하십시오.");
+            return false;
+        }
+        grouped.finish();
         QSqlQuery query(db);
         if (decision == QStringLiteral("RESET")) {
             query.prepare(QStringLiteral("DELETE FROM map_projection_review WHERE run_id=? AND object_id=?"));
@@ -599,5 +666,90 @@ bool InspectionMapWorkflow::review(const QString &projectDb, const QString &runI
             query.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
         }
         return exec(query, error);
+    });
+}
+
+bool InspectionMapWorkflow::group(const QString &projectDb, const QString &runId,
+                                  const QStringList &objectIds, const QString &representativeId,
+                                  const QString &kind, QString *error) {
+    if (runId.isEmpty() || !QStringList{QStringLiteral("DUPLICATE"),
+        QStringLiteral("CONNECTED")}.contains(kind)) return false;
+    const QSet<QString> selected(objectIds.cbegin(), objectIds.cend());
+    if (selected.size() < 2 || !selected.contains(representativeId)) {
+        if (error) *error = QStringLiteral("서로 다른 손상을 두 개 이상 선택하십시오."); return false;
+    }
+    if (!ensureSchema(projectDb, error)) return false;
+    return withDb(projectDb, error, [&](QSqlDatabase &db) {
+        QSqlQuery run(db);
+        run.prepare(QStringLiteral("SELECT inspection_id,dataset_id FROM map_projection_run "
+            "WHERE run_id=? AND active=1"));
+        run.addBindValue(runId);
+        if (!exec(run, error)) return false;
+        if (!run.next()) { if (error) *error = QStringLiteral("현재 투영 결과가 아닙니다."); return false; }
+        const QString inspectionId = run.value(0).toString(), datasetId = run.value(1).toString();
+        run.finish();
+        ProjectionBatch visible;
+        if (!active(projectDb, inspectionId, datasetId, &visible, error)) return false;
+        const ProjectedDamage *representative = nullptr;
+        for (const auto &item : visible.items) if (item.objectId == representativeId) representative = &item;
+        if (!representative || representative->status != QStringLiteral("PROJECTED") ||
+            !representative->groupId.isEmpty() ||
+            (kind == QStringLiteral("CONNECTED") && representative->type != QStringLiteral("crack"))) {
+            if (error) *error = QStringLiteral("투영된 미묶음 균열을 대표 손상으로 선택하십시오.");
+            return false;
+        }
+        for (const auto &id : selected) {
+            const auto found = std::find_if(visible.items.cbegin(), visible.items.cend(),
+                [&](const auto &item) { return item.objectId == id; });
+            if (found == visible.items.cend() || found->status != QStringLiteral("PROJECTED") ||
+                !found->groupId.isEmpty() || found->partId != representative->partId ||
+                found->faceId != representative->faceId || found->type != representative->type ||
+                (kind == QStringLiteral("CONNECTED") && found->paths.isEmpty())) {
+                if (error) *error = QStringLiteral("같은 부재·모델 면·유형의 미묶음 손상만 선택할 수 있습니다.");
+                return false;
+            }
+        }
+        if (!db.transaction()) { if (error) *error = db.lastError().text(); return false; }
+        const QString groupId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        QSqlQuery groupInsert(db);
+        groupInsert.prepare(QStringLiteral("INSERT INTO map_damage_group VALUES(?,?,?,?,?)"));
+        groupInsert.addBindValue(groupId); groupInsert.addBindValue(runId);
+        groupInsert.addBindValue(kind); groupInsert.addBindValue(representativeId);
+        groupInsert.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
+        if (!exec(groupInsert, error)) { db.rollback(); return false; }
+        QSqlQuery memberInsert(db);
+        memberInsert.prepare(QStringLiteral("INSERT INTO map_damage_group_member VALUES(?,?,?)"));
+        for (const auto &id : selected) {
+            memberInsert.bindValue(0, groupId); memberInsert.bindValue(1, runId);
+            memberInsert.bindValue(2, id);
+            if (!exec(memberInsert, error)) { db.rollback(); return false; }
+        }
+        if (!db.commit()) { if (error) *error = db.lastError().text(); db.rollback(); return false; }
+        return true;
+    });
+}
+
+bool InspectionMapWorkflow::ungroup(const QString &projectDb, const QString &runId,
+                                    const QString &groupId, QString *error) {
+    if (runId.isEmpty() || groupId.isEmpty()) return false;
+    if (!ensureSchema(projectDb, error)) return false;
+    return withDb(projectDb, error, [&](QSqlDatabase &db) {
+        QSqlQuery exists(db);
+        exists.prepare(QStringLiteral("SELECT 1 FROM map_damage_group g JOIN map_projection_run r "
+            "ON r.run_id=g.run_id WHERE g.group_id=? AND g.run_id=? AND r.active=1"));
+        exists.addBindValue(groupId); exists.addBindValue(runId);
+        if (!exec(exists, error)) return false;
+        if (!exists.next()) { if (error) *error = QStringLiteral("현재 손상 묶음이 아닙니다."); return false; }
+        exists.finish();
+        if (!db.transaction()) { if (error) *error = db.lastError().text(); return false; }
+        QSqlQuery remove(db);
+        remove.prepare(QStringLiteral("DELETE FROM map_damage_group_member WHERE group_id=? AND run_id=?"));
+        remove.addBindValue(groupId); remove.addBindValue(runId);
+        if (!exec(remove, error)) { db.rollback(); return false; }
+        remove.prepare(QStringLiteral("DELETE FROM map_damage_group WHERE group_id=? AND run_id=?"));
+        remove.addBindValue(groupId); remove.addBindValue(runId);
+        if (!exec(remove, error)) { db.rollback(); return false; }
+        if (!db.commit()) { if (error) *error = db.lastError().text(); db.rollback(); return false; }
+        return true;
     });
 }

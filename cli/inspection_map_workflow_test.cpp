@@ -9,6 +9,7 @@
 #include <QSqlQuery>
 #include <QTemporaryDir>
 #include <QDebug>
+#include <algorithm>
 #include <cstdio>
 
 int main(int argc, char *argv[]) {
@@ -112,5 +113,81 @@ int main(int argc, char *argv[]) {
         !InspectionMapWorkflow::active(dbPath, inspectionId, datasetId, &checked, &error) ||
         !reviewed(checked) || !reviewed(checked)->reviewState.isEmpty() ||
         reviewed(checked)->status != second.items.first().status) return 21;
+    QStringList crackIds;
+    for (const auto &item : second.items)
+        if (item.type == QStringLiteral("crack") && crackIds.size() < 2) crackIds.append(item.objectId);
+    if (crackIds.size() != 2) return 23;
+    for (const auto &id : crackIds) {
+        const auto source = std::find_if(second.items.cbegin(), second.items.cend(),
+            [&](const auto &item) { return item.objectId == id; });
+        ProjectedDamage trace = *source;
+        trace.partId = hit.partId; trace.faceId = hit.faceId; trace.drawingId = drawing->id;
+        trace.paths = {{hit.point, secondPoint}};
+        trace.lengthMm = corrected.lengthMm; trace.areaMm2 = 0;
+        if (!InspectionMapWorkflow::review(dbPath, second.runId, id, engine,
+                QStringLiteral("CORRECTED"), &trace, &error)) return 24;
+    }
+    if (!InspectionMapWorkflow::group(dbPath, second.runId, crackIds, crackIds.first(),
+            QStringLiteral("DUPLICATE"), &error) ||
+        !InspectionMapWorkflow::active(dbPath, inspectionId, datasetId, &checked, &error) ||
+        checked.items.size() != second.items.size()-1) return 25;
+    auto representative = std::find_if(checked.items.cbegin(), checked.items.cend(),
+        [&](const auto &item) { return item.objectId == crackIds.first(); });
+    if (representative == checked.items.cend() ||
+        representative->groupKind != QStringLiteral("DUPLICATE") ||
+        representative->sourceObjectIds.size() != 2) return 26;
+    const QString duplicateGroup = representative->groupId;
+    if (InspectionMapWorkflow::review(dbPath, second.runId, crackIds.first(), engine,
+            QStringLiteral("RESET"), nullptr, &error) ||
+        !InspectionMapWorkflow::ungroup(dbPath, second.runId, duplicateGroup, &error) ||
+        !InspectionMapWorkflow::active(dbPath, inspectionId, datasetId, &checked, &error) ||
+        checked.items.size() != second.items.size()) return 27;
+    if (!InspectionMapWorkflow::group(dbPath, second.runId, crackIds, crackIds.first(),
+            QStringLiteral("CONNECTED"), &error) ||
+        !InspectionMapWorkflow::active(dbPath, inspectionId, datasetId, &checked, &error) ||
+        checked.items.size() != second.items.size()-1) return 28;
+    representative = std::find_if(checked.items.cbegin(), checked.items.cend(),
+        [&](const auto &item) { return item.objectId == crackIds.first(); });
+    if (representative == checked.items.cend() ||
+        representative->groupKind != QStringLiteral("CONNECTED") ||
+        representative->paths.size() != 2 ||
+        qAbs(representative->lengthMm - 2 * corrected.lengthMm) > 0.001) return 29;
+    if (!InspectionMapWorkflow::ungroup(dbPath, second.runId, representative->groupId, &error) ||
+        !InspectionMapWorkflow::active(dbPath, inspectionId, datasetId, &checked, &error) ||
+        checked.items.size() != second.items.size()) return 30;
+    QStringList nativeIds;
+    const ProjectedDamage *nativeFirst = nullptr, *nativeSecond = nullptr;
+    for (const auto &item : second.items) {
+        if (item.type != QStringLiteral("crack") || item.status != QStringLiteral("PROJECTED") ||
+            item.paths.isEmpty() || item.boxLengthMm <= 0) continue;
+        const auto next = std::find_if(second.items.cbegin(), second.items.cend(), [&](const auto &candidate) {
+            return candidate.objectId != item.objectId && candidate.type == item.type &&
+                candidate.status == QStringLiteral("PROJECTED") && !candidate.paths.isEmpty() &&
+                candidate.partId == item.partId && candidate.faceId == item.faceId &&
+                candidate.boxLengthMm > 0;
+        });
+        if (next != second.items.cend()) {
+            nativeFirst = &item; nativeSecond = &*next;
+            nativeIds = {item.objectId, next->objectId}; break;
+        }
+    }
+    if (nativeIds.size() != 2) return 31;
+    for (const auto &id : nativeIds)
+        if (!InspectionMapWorkflow::review(dbPath, second.runId, id, engine,
+                QStringLiteral("RESET"), nullptr, &error)) return 32;
+    if (!InspectionMapWorkflow::group(dbPath, second.runId, nativeIds, nativeIds.first(),
+            QStringLiteral("CONNECTED"), &error) ||
+        !InspectionMapWorkflow::active(dbPath, inspectionId, datasetId, &checked, &error)) return 33;
+    representative = std::find_if(checked.items.cbegin(), checked.items.cend(),
+        [&](const auto &item) { return item.objectId == nativeIds.first(); });
+    if (representative == checked.items.cend() || !representative->reviewState.isEmpty() ||
+        representative->paths.size() != nativeFirst->paths.size() + nativeSecond->paths.size() ||
+        qAbs(representative->lengthMm - nativeFirst->lengthMm - nativeSecond->lengthMm) > 0.001 ||
+        qAbs(representative->boxLengthMm - nativeFirst->boxLengthMm - nativeSecond->boxLengthMm) > 0.001 ||
+        qAbs(representative->boxWidthMm - std::max(nativeFirst->boxWidthMm, nativeSecond->boxWidthMm)) > 0.001)
+        return 34;
+    if (!InspectionMapWorkflow::ungroup(dbPath, second.runId, representative->groupId, &error) ||
+        !InspectionMapWorkflow::active(dbPath, inspectionId, datasetId, &checked, &error) ||
+        checked.items.size() != second.items.size()) return 35;
     return 0;
 }
