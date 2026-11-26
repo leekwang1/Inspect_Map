@@ -28,6 +28,7 @@
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPointF>
+#include <QPainter>
 #include <QPushButton>
 #include <QRect>
 #include <QRubberBand>
@@ -39,6 +40,8 @@
 #include <QSqlQuery>
 #include <QSignalBlocker>
 #include <QSplitter>
+#include <QStyledItemDelegate>
+#include <QStyle>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QToolButton>
@@ -72,6 +75,17 @@
 #include <cmath>
 
 namespace {
+class RowSelectionDelegate : public QStyledItemDelegate {
+public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+
+    void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override {
+        QStyleOptionViewItem rowOption(option);
+        rowOption.state &= ~QStyle::State_HasFocus;
+        QStyledItemDelegate::paint(painter, rowOption, index);
+    }
+};
+
 QString id() { return QUuid::createUuid().toString(QUuid::WithoutBraces); }
 
 struct CameraPreviewItem {
@@ -522,8 +536,26 @@ public:
         icpRigid->setChecked(true);
         form->addLayout(icpModes);
         auto *automatic = new QPushButton(QStringLiteral("ICP 자동·정밀 정합"));
-        automatic->setToolTip(QStringLiteral("매번 원본 점군 또는 마지막 수동 대응점 정합 결과에서 시작합니다."));
+        automatic->setToolTip(QStringLiteral("원본 점군 또는 수동 정합 결과에서 0°·180°를 각각 계산합니다."));
         form->addWidget(automatic);
+        orientationTable_ = new QTableWidget(0, 4);
+        orientationTable_->setHorizontalHeaderLabels({QStringLiteral("초기 방향"), QStringLiteral("표면 RMSE(m)"),
+            QStringLiteral("겹침률"), QStringLiteral("판정")});
+        orientationTable_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+        orientationTable_->verticalHeader()->hide();
+        orientationTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
+        orientationTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        orientationTable_->setItemDelegate(new RowSelectionDelegate(orientationTable_));
+        orientationTable_->setStyleSheet(QStringLiteral(
+            "QTableWidget::item:selected {background:#dcece8;color:#173b37;border:0;border-radius:0;}"
+            "QTableWidget::item:focus {outline:none;border:0;}"));
+        orientationTable_->setMaximumHeight(110);
+        orientationTable_->hide();
+        form->addWidget(orientationTable_);
+        orientationStatus_ = new QLabel;
+        orientationStatus_->setWordWrap(true);
+        orientationStatus_->hide();
+        form->addWidget(orientationStatus_);
         metrics_ = new QLabel(QStringLiteral("정합 결과 없음"));
         metrics_->setWordWrap(true);
         form->addWidget(metrics_);
@@ -555,6 +587,10 @@ public:
         pairs_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
         pairs_->verticalHeader()->hide();
         pairs_->setSelectionBehavior(QAbstractItemView::SelectRows);
+        pairs_->setItemDelegate(new RowSelectionDelegate(pairs_));
+        pairs_->setStyleSheet(QStringLiteral(
+            "QTableWidget::item:selected {background:#dcece8;color:#173b37;border:0;border-radius:0;}"
+            "QTableWidget::item:focus {outline:none;border:0;}"));
         pairs_->setMinimumHeight(180);
         manualLayout->addWidget(pairs_);
         auto *editActions = new QHBoxLayout;
@@ -808,6 +844,17 @@ public:
         });
         connect(manual, &QPushButton::clicked, this, [this] { runManual(); });
         connect(automatic, &QPushButton::clicked, this, [this] { runIcp(); });
+        connect(orientationTable_, &QTableWidget::cellClicked, this, [this](int row) {
+            if (row < 0 || row >= orientationComparison_.candidates.size()) return;
+            const auto &candidate = orientationComparison_.candidates[row];
+            presentResult(QStringLiteral("ICP · %1° · ").arg(candidate.angleDegrees) +
+                (comparisonSimilarity_ ? QStringLiteral("Similarity · ") : QStringLiteral("RigidBody · ")) +
+                sideMode_->currentText(), candidate.matrix, landmarkRmse_, candidate.iterations);
+            orientationStatus_->setText(orientationComparison_.suggestedIndex < 0 ?
+                QStringLiteral("방향 판별 필요 · 선택한 후보의 촬영 위치·프러스텀과 기준점을 확인하십시오.") :
+                QStringLiteral("%1° 후보 추천 · 촬영 위치·프러스텀과 기준점을 확인한 뒤 저장하십시오.")
+                    .arg(orientationComparison_.candidates[orientationComparison_.suggestedIndex].angleDegrees));
+        });
         connect(applyAdjust, &QPushButton::clicked, this, [this] { applyAdjustment(); });
         connect(undoAdjust, &QPushButton::clicked, this, [this] { undoAdjustment(); });
         connect(save_, &QPushButton::clicked, this, [this] { saveResult(); });
@@ -1262,6 +1309,11 @@ private:
         matrix_ = nullptr;
         icpStart_ = nullptr;
         previousMatrix_ = nullptr;
+        orientationComparison_ = {};
+        orientationTable_->clearContents();
+        orientationTable_->setRowCount(0);
+        orientationTable_->hide();
+        orientationStatus_->hide();
         method_.clear();
         if (!savedMatrix_ || reviewId_.isEmpty()) reviewId_.clear();
         if (!savedMatrix_) metrics_->setText(QStringLiteral("정합 결과 없음"));
@@ -1458,6 +1510,8 @@ private:
         }
         icpStart_ = vtkSmartPointer<vtkMatrix4x4>::New();
         icpStart_->DeepCopy(fit);
+        orientationComparison_ = {};
+        orientationTable_->hide(); orientationStatus_->hide();
         presentResult(QStringLiteral("수동"), fit, rmse, 0);
         finishRegistrationRun(runId, QStringLiteral("REVIEW"), {});
     }
@@ -1485,22 +1539,40 @@ private:
         }
         const QString runId = startRegistrationRun();
         QApplication::setOverrideCursor(Qt::WaitCursor);
-        vtkNew<vtkMatrix4x4> fit;
-        int iterations = 0;
+        OrientationComparison comparison;
         QString error;
         const bool similarity = icpSimilarity_->isChecked();
-        const bool ok = RegistrationEngine::icp(cloudGeometry_, selectedModel_, icpStart_, similarity,
-                                                 fit, &iterations, &error);
+        const bool ok = RegistrationEngine::compareOrientations(cloudGeometry_, selectedModel_, icpStart_,
+                                                                 similarity, &comparison, &error);
         QApplication::restoreOverrideCursor();
         if (!ok) {
             finishRegistrationRun(runId, QStringLiteral("FAILED"), error);
             QMessageBox::warning(this, QStringLiteral("ICP 실패"), error); return;
         }
-        presentResult((icpStart_ ? QStringLiteral("수동 + ICP · ") : QStringLiteral("ICP · ")) +
-                      (similarity ? QStringLiteral("Similarity · ") : QStringLiteral("RigidBody · ")) +
-                      sideMode_->currentText(),
-                      fit, landmarkRmse_, iterations);
-        finishRegistrationRun(runId, QStringLiteral("REVIEW"), {});
+        orientationComparison_ = comparison;
+        comparisonSimilarity_ = similarity;
+        orientationTable_->setRowCount(comparison.candidates.size());
+        for (int row = 0; row < comparison.candidates.size(); ++row) {
+            const auto &candidate = comparison.candidates[row];
+            const QStringList values{QStringLiteral("%1°").arg(candidate.angleDegrees),
+                QString::number(candidate.metrics.rmse, 'f', 3),
+                QStringLiteral("%1%").arg(candidate.metrics.overlap * 100, 0, 'f', 1),
+                row == comparison.suggestedIndex ? QStringLiteral("추천") :
+                    comparison.suggestedIndex < 0 ? QStringLiteral("방향 판별 필요") : QStringLiteral("비교")};
+            for (int col = 0; col < values.size(); ++col)
+                orientationTable_->setItem(row, col, new QTableWidgetItem(values[col]));
+        }
+        orientationTable_->show(); orientationStatus_->show();
+        orientationStatus_->setText(comparison.suggestedIndex < 0 ?
+            QStringLiteral("두 방향의 점군 일치도가 비슷합니다. 방향 판별 필요 · 후보를 선택해 촬영 위치·프러스텀과 기준점을 확인하십시오.") :
+            QStringLiteral("%1° 후보 추천 · 자동 확정하지 않습니다. 후보를 선택해 촬영 위치·프러스텀을 확인하십시오.")
+                .arg(comparison.candidates[comparison.suggestedIndex].angleDegrees));
+        const auto &preview = comparison.candidates[0];
+        presentResult(QStringLiteral("ICP · 0° 미리보기"), preview.matrix, landmarkRmse_, preview.iterations);
+        save_->setEnabled(false);
+        confirm_->setEnabled(false);
+        status_->setText(QStringLiteral("0°·180° 비교 완료 · 후보를 클릭해 방향을 선택하십시오."));
+        finishRegistrationRun(runId, QStringLiteral("REVIEW"), orientationStatus_->text());
     }
 
     QString startRegistrationRun() {
@@ -1699,13 +1771,14 @@ private:
     int missingSideParts_ = 0;
     QListWidget *partList_ = nullptr;
     QLabel *modelInfo_ = nullptr, *selectedInfo_ = nullptr, *cloudInfo_ = nullptr, *metrics_ = nullptr, *status_ = nullptr;
-    QTableWidget *pairs_ = nullptr;
+    QTableWidget *pairs_ = nullptr, *orientationTable_ = nullptr;
     QCheckBox *allowScale_ = nullptr, *poseSameFrame_ = nullptr;
     QPushButton *icpSimilarity_ = nullptr;
     QCheckBox *showPreviewCloud_ = nullptr, *showCameraCenters_ = nullptr, *showSelectedFrustum_ = nullptr;
     QPushButton *previewOriginal_ = nullptr, *previewAligned_ = nullptr;
     QComboBox *previewCamera_ = nullptr, *previewModelMode_ = nullptr;
     QLabel *cameraStatus_ = nullptr;
+    QLabel *orientationStatus_ = nullptr;
     QVector<CameraPreviewItem> cameras_;
     PreviewIntrinsics previewIntrinsics_;
     QPushButton *save_ = nullptr, *confirm_ = nullptr;
@@ -1725,6 +1798,8 @@ private:
     QVector<QVector3D> sourcePairs_, targetPairs_;
     std::optional<QVector3D> pendingSource_, pendingTarget_;
     RegistrationMetrics resultMetrics_;
+    OrientationComparison orientationComparison_;
+    bool comparisonSimilarity_ = false;
     double landmarkRmse_ = 0;
     int iterations_ = 0;
 };

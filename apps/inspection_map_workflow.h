@@ -28,7 +28,6 @@ struct ProjectionBatch {
     QString runId;
     QString registrationId;
     QList<ProjectedDamage> items;
-    int legacyDimensions = 0;
 };
 
 class InspectionMapWorkflow {
@@ -37,8 +36,7 @@ public:
     static bool run(const QString &projectDb, const QString &inspectionId, const QString &datasetId,
                     const InspectionMapEngine &engine, ProjectionBatch *batch, QString *error);
     static bool active(const QString &projectDb, const QString &inspectionId, const QString &datasetId,
-                       ProjectionBatch *batch, QString *error,
-                       const InspectionMapEngine *engine = nullptr);
+                       ProjectionBatch *batch, QString *error);
     static bool review(const QString &projectDb, const QString &runId, const QString &objectId,
                        const InspectionMapEngine &engine,
                        const QString &decision, const ProjectedDamage *corrected, QString *error);

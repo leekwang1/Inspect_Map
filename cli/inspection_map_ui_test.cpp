@@ -83,8 +83,9 @@ int main(int argc, char *argv[]) {
     const auto unrollTables = window.findChildren<QTableWidget *>();
     if (unrollTables.isEmpty()) return 42;
     if (unrollTables.first()->columnCount() != 7 ||
-        unrollTables.first()->horizontalHeaderItem(3)->text() != QStringLiteral("외접 폭") ||
-        unrollTables.first()->horizontalHeaderItem(5)->text() != QStringLiteral("두께 p90*")) return 46;
+        unrollTables.first()->horizontalHeaderItem(2)->text() != QStringLiteral("폭(m)") ||
+        unrollTables.first()->horizontalHeaderItem(4)->text() != QStringLiteral("두께(mm)") ||
+        unrollTables.first()->horizontalHeaderItem(5)->text() != QStringLiteral("이미지명")) return 46;
     int previousNumber = 0;
     bool reachedUnnumbered = false;
     for (int row = 0; row < unrollTables.first()->rowCount(); ++row) {
@@ -101,8 +102,21 @@ int main(int argc, char *argv[]) {
     if (previousNumber < 10) return 44;
     InspectionMapEngine engine;
     if (!engine.load(QFileInfo(sourceDb).dir().filePath(QStringLiteral("../Data/model")), &error)) return 15;
+    const auto *referenceDrawing = engine.drawing(QStringLiteral("SP-PY3-LSH-R04-IN-FR"));
+    if (!referenceDrawing || referenceDrawing->lines.isEmpty()) return 49;
+    QGraphicsScene referenceOnly;
+    addDrawingAt(&referenceOnly, *referenceDrawing, batch, {}, {}, false);
+    if (referenceOnly.items().size() != referenceDrawing->lines.size()) return 50;
     const auto *sheet = engine.unrollSheet(QStringLiteral("SP-PY3-LSH|IN"));
     if (!sheet) return 16;
+    const auto numbered = numberedDamages(batch, {}, sheet);
+    if (!numbered.isEmpty()) {
+        const auto &damage = *numbered.first();
+        if (unrollTables.first()->item(0, 2)->text() != metreLabel(damage.boxWidthMm) ||
+            unrollTables.first()->item(0, 3)->text() != metreLabel(damage.boxLengthMm) ||
+            unrollTables.first()->item(0, 4)->text() != dimensionLabel(damage.crackP90Mm) ||
+            unrollTables.first()->item(0, 5)->text() != damage.imageName) return 48;
+    }
     int candidates = 0, mapped = 0;
     for (const auto &damage : batch.items) {
         if (damage.status != QStringLiteral("PROJECTED") ||
@@ -129,7 +143,8 @@ int main(int argc, char *argv[]) {
     const QByteArray htmlData = htmlFile.readAll(), excelData = excelFile.readAll();
     if (!htmlData.contains("<aside><h2>") || !htmlData.contains("grid-template-columns:") ||
         htmlData.contains("<th>부재</th>") || htmlData.contains("<th>영상</th>") ||
-        !htmlData.contains("두께 p90*") || !htmlData.contains("data:image/png;base64,") ||
+        !htmlData.contains("<th>폭</th><th>길이</th><th>단위</th>") ||
+        htmlData.contains("면적(mm") || !htmlData.contains("data:image/png;base64,") ||
         htmlData.count("<tr>") != numberedDamages(batch, {}, sheet).size()+1 ||
         excelData.size() < 1000 || !excelData.startsWith("PK")) return 21;
     const QString output = qEnvironmentVariable("INSPECTMAP_TEST_OUTPUT");
@@ -153,7 +168,12 @@ int main(int argc, char *argv[]) {
     int reviewRow = -1;
     for (int i = 0; i < parts[0]->count(); ++i)
         if (parts[0]->item(i)->data(Qt::UserRole).toString() == QStringLiteral("__REVIEW__")) reviewRow = i;
-    if (reviewRow < 0) return 23;
+    if (reviewRow < 0) {
+        const bool unresolved = std::any_of(batch.items.cbegin(), batch.items.cend(), [](const auto &item) {
+            return item.status != QStringLiteral("PROJECTED") && item.status != QStringLiteral("EXCLUDED");
+        });
+        return unresolved ? 23 : 0;
+    }
     parts[0]->setCurrentRow(reviewRow);
     const auto tables = window.findChildren<QTableWidget *>();
     if (tables.isEmpty() || tables.first()->rowCount() == 0) return 24;

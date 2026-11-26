@@ -460,8 +460,7 @@ bool InspectionMapWorkflow::run(const QString &projectDb, const QString &inspect
 }
 
 bool InspectionMapWorkflow::active(const QString &projectDb, const QString &inspectionId, const QString &datasetId,
-                                   ProjectionBatch *batch, QString *error,
-                                   const InspectionMapEngine *engine) {
+                                   ProjectionBatch *batch, QString *error) {
     if (!batch) return false;
     *batch = {};
     if (!ensureSchema(projectDb, error)) return false;
@@ -515,43 +514,6 @@ bool InspectionMapWorkflow::active(const QString &projectDb, const QString &insp
             } else if (item.reviewState == QStringLiteral("EXCLUDED")) {
                 item.status = QStringLiteral("EXCLUDED"); item.reason = QStringLiteral("망도 검토 제외");
                 item.lengthMm = 0; item.areaMm2 = 0;
-            }
-        }
-        reviews.finish();
-        if (engine) {
-            QSqlQuery source(db);
-            source.prepare(QStringLiteral("SELECT geometry_json,bbox_json,measurements_json "
-                "FROM damage_object WHERE object_id=?"));
-            QHash<QString, Camera> cameras;
-            for (auto &item : batch->items) {
-                if (item.status != QStringLiteral("PROJECTED") ||
-                    (item.boxWidthMm > 0 && item.boxLengthMm > 0 &&
-                     (item.type != QStringLiteral("crack") || item.crackP90Mm > 0))) continue;
-                source.bindValue(0, item.objectId);
-                if (!exec(source, error)) return false;
-                if (!source.next()) { source.finish(); continue; }
-                const auto geometry = QJsonDocument::fromJson(source.value(0).toByteArray()).object();
-                const auto bbox = QJsonDocument::fromJson(source.value(1).toByteArray()).array();
-                const auto measurements = QJsonDocument::fromJson(source.value(2).toByteArray()).object();
-                source.finish();
-                const double oldWidth = item.boxWidthMm, oldLength = item.boxLengthMm;
-                const double oldP90 = item.crackP90Mm;
-                if (item.type == QStringLiteral("crack") && item.crackP90Mm <= 0 &&
-                    measurements.value(QStringLiteral("width_resolvable")).toBool()) {
-                    const double p90 = measurements.value(QStringLiteral("width_p90"))
-                        .toObject().value(QStringLiteral("mm")).toDouble();
-                    if (std::isfinite(p90) && p90 > 0) item.crackP90Mm = p90;
-                }
-                if (item.reviewState != QStringLiteral("CORRECTED") &&
-                    (item.boxWidthMm <= 0 || item.boxLengthMm <= 0)) {
-                    if (!cameras.contains(item.imageId))
-                        cameras.insert(item.imageId, camera(db, projectDb, item.imageId, batch->registrationId));
-                    if (cameras.value(item.imageId).valid)
-                        projectedBox(*engine, cameras.value(item.imageId), geometry, bbox,
-                                     item.faceId, &item.boxWidthMm, &item.boxLengthMm);
-                }
-                if (item.boxWidthMm != oldWidth || item.boxLengthMm != oldLength ||
-                    item.crackP90Mm != oldP90) ++batch->legacyDimensions;
             }
         }
         return true;

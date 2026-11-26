@@ -86,6 +86,13 @@ QString dimensionLabel(double value) {
     return value > 0 ? QString::number(value, 'f', 1) : QStringLiteral("—");
 }
 
+QString metreLabel(double millimetres) {
+    if (millimetres <= 0) return QStringLiteral("—");
+    QString value = QString::number(millimetres / 1000.0, 'f', 3);
+    while (value.endsWith(QLatin1Char('0')) && !value.endsWith(QStringLiteral(".0"))) value.chop(1);
+    return value;
+}
+
 QString typeLabel(const QString &type) {
     if (type == QStringLiteral("crack")) return QStringLiteral("균열");
     if (type == QStringLiteral("crack_region")) return QStringLiteral("균열");
@@ -93,6 +100,14 @@ QString typeLabel(const QString &type) {
     if (type == QStringLiteral("exposed_rebar")) return QStringLiteral("철근 노출");
     if (type == QStringLiteral("leakage_wetspot")) return QStringLiteral("누수·습윤");
     return type;
+}
+
+QString quantityTypeLabel(const ProjectedDamage &damage) {
+    if (damage.type != QStringLiteral("crack") && damage.type != QStringLiteral("crack_region"))
+        return typeLabel(damage.type);
+    if (damage.crackP90Mm <= 0) return QStringLiteral("균열");
+    return damage.crackP90Mm >= 0.3 ? QStringLiteral("균열 (cw≥0.3mm)") :
+        QStringLiteral("균열 (cw<0.3mm)");
 }
 
 QTransform previewOrientation(QImageIOHandler::Transformations flags, const QSize &size) {
@@ -222,7 +237,8 @@ QRectF drawingBounds(const MapDrawing &drawing) {
 }
 
 void addDrawingAt(QGraphicsScene *scene, const MapDrawing &drawing, const ProjectionBatch &batch,
-                  const QPointF &offset, const QVector<const ProjectedDamage *> &numbered) {
+                  const QPointF &offset, const QVector<const ProjectedDamage *> &numbered,
+                  bool showDamage = true) {
     const QPen outline(QColor(86, 106, 116), 0);
     for (const auto &line : drawing.lines) {
         QPainterPath path;
@@ -232,6 +248,7 @@ void addDrawingAt(QGraphicsScene *scene, const MapDrawing &drawing, const Projec
         }
         scene->addPath(path, outline);
     }
+    if (!showDamage) return;
     for (const auto &damage : batch.items) {
         if (damage.drawingId != drawing.id || damage.status != QStringLiteral("PROJECTED")) continue;
         QPen pen(QColor(196, 52, 49), 2); pen.setCosmetic(true);
@@ -342,7 +359,7 @@ void fillVerifiedUnrollScene(QGraphicsScene *scene, const UnrollSheet &sheet,
         const QRectF bounds = drawingBounds(drawing);
         referenceBounds = hasReference ? referenceBounds.united(bounds) : bounds;
         hasReference = true;
-        addDrawingAt(scene, drawing, batch, {}, {});
+        addDrawingAt(scene, drawing, batch, {}, {}, false);
     }
     if (sheet.faces.isEmpty()) return;
     const QPointF shift = verifiedUnrollOffset(sheet, engine);
@@ -403,15 +420,17 @@ void fillVerifiedUnrollScene(QGraphicsScene *scene, const UnrollSheet &sheet,
 void drawQuantityTable(QPainter *painter, QPdfWriter *pdf, const QRect &area,
                        const QVector<const ProjectedDamage *> &damages) {
     const int left = area.left(), right = area.right(), rowHeight = 24;
-    const QVector<int> edges{left, left+45, left+125, left+235, left+345, left+490, right};
+    const int width = right-left;
+    const QVector<int> edges{left, left+width*9/100, left+width*51/100,
+        left+width*66/100, left+width*82/100, right};
     int y = area.top();
     auto header = [&] {
         painter->setPen(QColor(30, 53, 68));
         QFont font = painter->font(); font.setBold(true); font.setPixelSize(18); painter->setFont(font);
-        painter->drawText(left, y-10, QStringLiteral("손상 물량표 · mm / mm²"));
+        painter->drawText(left, y-10, QStringLiteral("손상 물량표"));
         font.setBold(false); font.setPixelSize(13); painter->setFont(font);
-        const QStringList names{QStringLiteral("번호"), QStringLiteral("유형"), QStringLiteral("외접 폭"),
-            QStringLiteral("외접 길이"), QStringLiteral("두께 p90*"), QStringLiteral("면적")};
+        const QStringList names{QStringLiteral("번호"), QStringLiteral("유형"), QStringLiteral("폭"),
+            QStringLiteral("길이"), QStringLiteral("단위")};
         for (int c = 0; c < names.size(); ++c)
             painter->drawText(QRect(edges[c]+4, y, edges[c+1]-edges[c]-8, rowHeight),
                               Qt::AlignVCenter | Qt::AlignLeft, names[c]);
@@ -424,9 +443,8 @@ void drawQuantityTable(QPainter *painter, QPdfWriter *pdf, const QRect &area,
             pdf->newPage(); y = area.top(); header();
         }
         const auto &d = *damages[i];
-        const QStringList values{QString::number(i+1), typeLabel(d.type),
-            dimensionLabel(d.boxWidthMm), dimensionLabel(d.boxLengthMm),
-            dimensionLabel(d.crackP90Mm), dimensionLabel(d.areaMm2)};
+        const QStringList values{QString::number(i+1), quantityTypeLabel(d),
+            metreLabel(d.boxWidthMm), metreLabel(d.boxLengthMm), QStringLiteral("m")};
         for (int c = 0; c < values.size(); ++c)
             painter->drawText(QRect(edges[c]+4, y, edges[c+1]-edges[c]-8, rowHeight),
                               Qt::AlignVCenter | Qt::AlignLeft, painter->fontMetrics().elidedText(
@@ -436,7 +454,7 @@ void drawQuantityTable(QPainter *painter, QPdfWriter *pdf, const QRect &area,
     }
     painter->setPen(QColor(82, 107, 120));
     painter->drawText(QRect(left, area.bottom()+8, right-left, 35), Qt::TextWordWrap,
-        QStringLiteral("* 두께는 영상 추정 p90이며 실측 개구폭이 아닙니다. 외접 치수는 모델 표면 투영값입니다."));
+        QStringLiteral("폭·길이는 모델 표면 투영값(m)입니다. 균열 유형의 cw는 영상 추정 두께 p90(mm)이며 실측값이 아닙니다."));
 }
 
 void append16(QByteArray *out, quint16 value) {
@@ -457,8 +475,7 @@ bool writeXlsx(const QString &path, const QVector<const ProjectedDamage *> &dama
     QString xml = QStringLiteral("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
         "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>");
     const QStringList headings{QStringLiteral("번호"), QStringLiteral("유형"),
-        QStringLiteral("외접 폭(mm)"), QStringLiteral("외접 길이(mm)"),
-        QStringLiteral("두께-영상 p90(mm)"), QStringLiteral("면적(mm2)")};
+        QStringLiteral("폭"), QStringLiteral("길이"), QStringLiteral("단위")};
     auto textCell = [&xml](int row, int col, const QString &value) {
         xml += QStringLiteral("<c r=\"%1%2\" t=\"inlineStr\"><is><t>%3</t></is></c>")
             .arg(QChar('A'+col)).arg(row).arg(value.toHtmlEscaped());
@@ -473,11 +490,10 @@ bool writeXlsx(const QString &path, const QVector<const ProjectedDamage *> &dama
     for (int i = 0; i < damages.size(); ++i) {
         const auto &d = *damages[i]; const int row = i+2;
         xml += QStringLiteral("<row r=\"%1\">").arg(row);
-        numberCell(row, 0, i+1); textCell(row, 1, typeLabel(d.type));
-        if (d.boxWidthMm > 0) numberCell(row, 2, d.boxWidthMm);
-        if (d.boxLengthMm > 0) numberCell(row, 3, d.boxLengthMm);
-        if (d.crackP90Mm > 0) numberCell(row, 4, d.crackP90Mm);
-        if (d.areaMm2 > 0) numberCell(row, 5, d.areaMm2);
+        numberCell(row, 0, i+1); textCell(row, 1, quantityTypeLabel(d));
+        if (d.boxWidthMm > 0) numberCell(row, 2, d.boxWidthMm / 1000.0);
+        if (d.boxLengthMm > 0) numberCell(row, 3, d.boxLengthMm / 1000.0);
+        textCell(row, 4, QStringLiteral("m"));
         xml += QStringLiteral("</row>");
     }
     xml += QStringLiteral("<row r=\"%1\">").arg(damages.size()+3);
@@ -643,10 +659,10 @@ public:
         summary_ = new QLabel(QStringLiteral("투영 결과 없음"));
         summary_->setWordWrap(true);
         rightLayout->addWidget(summary_);
-        rightLayout->addWidget(new QLabel(QStringLiteral("손상 물량표 · 단위 mm / mm²")));
+        rightLayout->addWidget(new QLabel(QStringLiteral("손상 물량표 · 폭·길이 m / 두께 mm")));
         items_ = new QTableWidget(0, 7);
-        items_->setHorizontalHeaderLabels({QStringLiteral("번호"), QStringLiteral("유형"), QStringLiteral("상태"),
-            QStringLiteral("외접 폭"), QStringLiteral("외접 길이"), QStringLiteral("두께 p90*"), QStringLiteral("면적")});
+        items_->setHorizontalHeaderLabels({QStringLiteral("번호"), QStringLiteral("유형"), QStringLiteral("폭(m)"),
+            QStringLiteral("길이(m)"), QStringLiteral("두께(mm)"), QStringLiteral("이미지명"), QStringLiteral("비고")});
         items_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
         items_->horizontalHeader()->setStretchLastSection(true);
         items_->verticalHeader()->hide();
@@ -835,10 +851,7 @@ private:
         if (!projectDb_.isEmpty() && !inspectionId_.isEmpty() && dataset_->currentIndex() >= 0) {
             QString error;
             if (!InspectionMapWorkflow::active(projectDb_, inspectionId_, dataset_->currentData().toString(),
-                                               &batch_, &error, &engine_)) statusBar()->showMessage(error);
-            else if (batch_.legacyDimensions > 0)
-                statusBar()->showMessage(QStringLiteral("기존 투영 결과 %1건의 치수를 표시용으로 계산했습니다. 재투영하면 DB에 저장됩니다.")
-                    .arg(batch_.legacyDimensions), 12000);
+                                               &batch_, &error)) statusBar()->showMessage(error);
         }
         refreshParts();
         updateReviewInfo();
@@ -1183,13 +1196,14 @@ private:
             const bool excluded = sheet && item.status == QStringLiteral("PROJECTED") &&
                 std::none_of(sheet->faces.cbegin(), sheet->faces.cend(),
                     [&](const auto &face) { return face.faceId == item.faceId; });
-            items_->setItem(row, 2, new QTableWidgetItem(excluded ? QStringLiteral("전개 제외") :
-                item.reviewState == QStringLiteral("DEFERRED") ? QStringLiteral("보류") : statusLabel(item.status)));
             const bool measured = item.status == QStringLiteral("PROJECTED");
-            items_->setItem(row, 3, new QTableWidgetItem(dimensionLabel(measured ? item.boxWidthMm : 0)));
-            items_->setItem(row, 4, new QTableWidgetItem(dimensionLabel(measured ? item.boxLengthMm : 0)));
-            items_->setItem(row, 5, new QTableWidgetItem(dimensionLabel(measured ? item.crackP90Mm : 0)));
-            items_->setItem(row, 6, new QTableWidgetItem(dimensionLabel(measured ? item.areaMm2 : 0)));
+            items_->setItem(row, 2, new QTableWidgetItem(metreLabel(measured ? item.boxWidthMm : 0)));
+            items_->setItem(row, 3, new QTableWidgetItem(metreLabel(measured ? item.boxLengthMm : 0)));
+            items_->setItem(row, 4, new QTableWidgetItem(dimensionLabel(measured ? item.crackP90Mm : 0)));
+            items_->setItem(row, 5, new QTableWidgetItem(item.imageName));
+            const QString note = excluded ? QStringLiteral("전개 제외") :
+                item.reviewState == QStringLiteral("DEFERRED") ? QStringLiteral("보류") : statusLabel(item.status);
+            items_->setItem(row, 6, new QTableWidgetItem(note));
             for (int col = 0; col < 7; ++col) {
                 items_->item(row, col)->setData(Qt::UserRole, item.objectId);
                 items_->item(row, col)->setToolTip(item.imageName + QStringLiteral("\n") +
@@ -1299,16 +1313,15 @@ private:
         html += QStringLiteral("<div class=\"sheet\"><img alt=\"부재 망도\" src=\"data:image/png;base64,%1\">")
             .arg(QString::fromLatin1(png.toBase64()));
         html += QStringLiteral("<aside><h2>손상 물량표</h2><table><thead><tr><th>번호</th><th>유형</th>"
-            "<th>외접 폭(mm)</th><th>외접 길이(mm)</th><th>두께 p90*(mm)</th><th>면적(mm²)</th>"
+            "<th>폭</th><th>길이</th><th>단위</th>"
             "</tr></thead><tbody>");
         for (int i = 0; i < damages.size(); ++i) {
             const auto &d = *damages[i];
-            html += QStringLiteral("<tr><td>%1</td><td>%2</td><td>%3</td><td>%4</td><td>%5</td><td>%6</td></tr>")
-                .arg(i+1).arg(typeLabel(d.type).toHtmlEscaped(), dimensionLabel(d.boxWidthMm),
-                    dimensionLabel(d.boxLengthMm), dimensionLabel(d.crackP90Mm),
-                    dimensionLabel(d.areaMm2));
+            html += QStringLiteral("<tr><td>%1</td><td>%2</td><td>%3</td><td>%4</td><td>m</td></tr>")
+                .arg(i+1).arg(quantityTypeLabel(d).toHtmlEscaped(), metreLabel(d.boxWidthMm),
+                    metreLabel(d.boxLengthMm));
         }
-        html += QStringLiteral("</tbody></table><p class=\"note\">* 두께는 영상 추정 p90이며 실측 개구폭이 아닙니다. 외접 치수는 모델 표면 투영값입니다.</p></aside></div></body></html>");
+        html += QStringLiteral("</tbody></table><p class=\"note\">폭·길이는 모델 표면 투영값(m)입니다. 균열 유형의 cw는 영상 추정 두께 p90(mm)이며 실측값이 아닙니다.</p></aside></div></body></html>");
         QSaveFile file(path);
         if (!file.open(QIODevice::WriteOnly)) return false;
         const QByteArray bytes = html.toUtf8();

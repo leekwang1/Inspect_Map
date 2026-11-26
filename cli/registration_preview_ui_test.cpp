@@ -27,6 +27,11 @@ int main(int argc, char *argv[]) {
     app.processEvents();
     const auto widgets = window.findChildren<QVTKOpenGLNativeWidget *>();
     const auto lists = window.findChildren<QListWidget *>();
+    const auto tables = window.findChildren<QTableWidget *>();
+    if (tables.size() < 2) return 8;
+    for (auto *table : tables)
+        if (!dynamic_cast<RowSelectionDelegate *>(table->itemDelegate()) ||
+            !table->styleSheet().contains(QStringLiteral("outline:none"))) return 9;
     if (widgets.size() != 3 || lists.isEmpty() || lists.first()->count() == 0) return 4;
     auto *resultView = static_cast<PickView *>(widgets[2]);
     auto *matrix = previewMatrix(resultView);

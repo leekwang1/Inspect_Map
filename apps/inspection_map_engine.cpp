@@ -452,14 +452,33 @@ bool InspectionMapEngine::load(const QString &root, QString *error) {
         if (!matrices.contains(partId)) continue;
         MapDrawing drawing;
         if (!readDxf(path, matrices.value(partId), &drawing, error)) return false;
-        const int index = drawings_.size();
-        for (const auto &faceId : drawing.faceIds)
-            if (!faceDrawing_.contains(faceId)) faceDrawing_.insert(faceId, index);
         drawings_.append(std::move(drawing));
     }
     std::sort(drawings_.begin(), drawings_.end(), [](const auto &a, const auto &b) {
         return a.id < b.id;
     });
+    QSet<QString> explicitFaces;
+    for (const auto &drawing : drawings_) explicitFaces.unite(drawing.faceIds);
+    QHash<QString, QSet<QString>> modelFaces;
+    for (const auto &triangle : triangles_) modelFaces[triangle.partId].insert(triangle.faceId);
+    QHash<QString, int> inferredOwners;
+    for (int i = 0; i < drawings_.size(); ++i) {
+        const auto &drawing = drawings_[i];
+        if (!drawing.faceIds.isEmpty() ||
+            !drawing.id.startsWith(drawing.partId + QLatin1Char('-'))) continue;
+        QString prefix = drawing.id + QLatin1Char('-');
+        if (drawing.id == drawing.partId + QStringLiteral("-TP") ||
+            drawing.id == drawing.partId + QStringLiteral("-BT"))
+            prefix = drawing.partId + QStringLiteral("-CAP-") + drawing.id.section(QLatin1Char('-'), -1) + QLatin1Char('-');
+        for (const auto &faceId : modelFaces.value(drawing.partId)) {
+            if (explicitFaces.contains(faceId) || !faceId.startsWith(prefix)) continue;
+            const auto owner = inferredOwners.constFind(faceId);
+            if (owner == inferredOwners.cend()) inferredOwners.insert(faceId, i);
+            else if (owner.value() != i) inferredOwners[faceId] = -1;
+        }
+    }
+    for (auto it = inferredOwners.cbegin(); it != inferredOwners.cend(); ++it)
+        if (it.value() >= 0) drawings_[it.value()].faceIds.insert(it.key());
     faceDrawing_.clear();
     for (int i = 0; i < drawings_.size(); ++i)
         for (const auto &faceId : drawings_[i].faceIds)

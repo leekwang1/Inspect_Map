@@ -55,6 +55,18 @@ int main(int argc, char *argv[]) {
             return 4;
     const auto metrics = RegistrationEngine::measure(sourceCloud, targetCloud, refined, 0.1);
     if (metrics.overlap < 0.99 || metrics.rmse > 1e-4) return 5;
+    OrientationComparison compared;
+    if (!RegistrationEngine::compareOrientations(sourceCloud, targetCloud, rigid, false,
+                                                  &compared, &error) || compared.candidates.size() != 2 ||
+        compared.candidates[0].angleDegrees != 0 || compared.candidates[1].angleDegrees != 180 ||
+        compared.candidates[0].metrics.overlap < 0.99 ||
+        compared.candidates[0].metrics.rmse > 1e-4) return 16;
+    const QVector<QVector3D> symmetricPoints{{-1, -1, 0}, {-1, 1, 0}, {1, -1, 0}, {1, 1, 0},
+                                             {-1, -1, 2}, {-1, 1, 2}, {1, -1, 2}, {1, 1, 2}};
+    auto symmetricCloud = RegistrationEngine::cloudGeometry(symmetricPoints);
+    if (!RegistrationEngine::compareOrientations(symmetricCloud, symmetricCloud, nullptr, false,
+                                                  &compared, &error) ||
+        compared.candidates.size() != 2 || compared.suggestedIndex != -1) return 17;
     auto scaledCloud = RegistrationEngine::cloudGeometry(scaled);
     vtkNew<vtkMatrix4x4> nearSimilarity;
     nearSimilarity->DeepCopy(similarity);

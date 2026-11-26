@@ -52,38 +52,15 @@ int main(int argc, char *argv[]) {
     if (!InspectionMapWorkflow::active(dbPath, inspectionId, datasetId, &restored, &error) ||
         restored.runId != first.runId || restored.items.size() != first.items.size()) return 11;
     int measuredCracks = 0;
-    QString legacyObjectId;
     for (const auto &item : first.items) {
         if (item.status != QStringLiteral("PROJECTED") || item.type != QStringLiteral("crack") ||
             item.boxWidthMm <= 0 || item.boxLengthMm <= item.boxWidthMm || item.crackP90Mm <= 0) continue;
         for (const auto &saved : restored.items) if (saved.objectId == item.objectId &&
             qAbs(saved.boxWidthMm-item.boxWidthMm) < 0.001 &&
             qAbs(saved.boxLengthMm-item.boxLengthMm) < 0.001 &&
-            qAbs(saved.crackP90Mm-item.crackP90Mm) < 0.001) {
-            ++measuredCracks;
-            legacyObjectId = item.objectId;
-        }
+            qAbs(saved.crackP90Mm-item.crackP90Mm) < 0.001) ++measuredCracks;
     }
     if (measuredCracks == 0) return 22;
-    {
-        auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("legacy-map-test"));
-        db.setDatabaseName(dbPath);
-        if (!db.open()) return 23;
-        QSqlQuery query(db);
-        query.prepare(QStringLiteral("UPDATE map_projection_item SET box_width_mm=0,"
-            "box_length_mm=0,crack_p90_mm=0 WHERE run_id=? AND object_id=?"));
-        query.addBindValue(first.runId); query.addBindValue(legacyObjectId);
-        if (!query.exec() || query.numRowsAffected() != 1) return 24;
-        db.close();
-    }
-    QSqlDatabase::removeDatabase(QStringLiteral("legacy-map-test"));
-    ProjectionBatch legacy;
-    if (!InspectionMapWorkflow::active(dbPath, inspectionId, datasetId, &legacy, &error, &engine) ||
-        legacy.legacyDimensions < 1) return 25;
-    bool recovered = false;
-    for (const auto &item : legacy.items) if (item.objectId == legacyObjectId)
-        recovered = item.boxWidthMm > 0 && item.boxLengthMm > 0 && item.crackP90Mm > 0;
-    if (!recovered) return 26;
     ProjectionBatch second;
     if (!InspectionMapWorkflow::run(dbPath, inspectionId, datasetId, engine, &second, &error) ||
         second.runId == first.runId || second.items.size() != first.items.size()) return 12;

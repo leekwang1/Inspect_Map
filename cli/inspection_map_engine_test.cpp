@@ -10,8 +10,10 @@
 int main(int argc, char *argv[]) {
     QCoreApplication app(argc, argv);
     if (argc < 2) return 1;
-    InspectionMapEngine engine;
+    const bool fallbackOnly = QString::fromLocal8Bit(argv[1]) == QStringLiteral("--filename-fallback");
     QString error;
+    if (!fallbackOnly) {
+    InspectionMapEngine engine;
     if (!engine.load(QString::fromLocal8Bit(argv[1]), &error)) {
         qCritical().noquote() << error;
         return 2;
@@ -47,6 +49,10 @@ int main(int argc, char *argv[]) {
     QPointF mappedPoint;
     if (!sheet->point(sheet->faces.first().faceId, mapped.source.a, &mappedPoint) ||
         (mappedPoint-mapped.a).manhattanLength() > 0.001) return 11;
+    qInfo() << "Parts" << engine.parts().size() << "faces" << engine.triangleCount()
+            << "drawings" << engine.drawings().size() << "unroll sheets" << engine.unrollSheets().size()
+            << "LSH exterior faces" << sheet->faces.size();
+    }
     QTemporaryDir temporary;
     if (!temporary.isValid() || !QDir().mkpath(temporary.filePath(QStringLiteral("model/BOX")))) return 12;
     QFile metadata(temporary.filePath(QStringLiteral("model/BOX/meta.gxxml")));
@@ -71,8 +77,39 @@ int main(int argc, char *argv[]) {
         minX = std::min(minX, point.x()); maxX = std::max(maxX, point.x());
     }
     if (qAbs(maxX-minX-4.0) > 0.001) return 17;
-    qInfo() << "Parts" << engine.parts().size() << "faces" << engine.triangleCount()
-            << "drawings" << engine.drawings().size() << "unroll sheets" << engine.unrollSheets().size()
-            << "LSH exterior faces" << sheet->faces.size();
+    if (!QDir().mkpath(temporary.filePath(QStringLiteral("model/NAMED"))) ||
+        !QDir().mkpath(temporary.filePath(QStringLiteral("map/NAMED")))) return 19;
+    QFile namedMetadata(temporary.filePath(QStringLiteral("model/NAMED/meta.gxxml")));
+    if (!namedMetadata.open(QIODevice::WriteOnly) || namedMetadata.write(
+        "<Softgraphy><Transform sx='1' sy='1' sz='1'/></Softgraphy>") < 0) return 20;
+    namedMetadata.close();
+    QFile namedObject(temporary.filePath(QStringLiteral("model/NAMED/NAMED.obj")));
+    if (!namedObject.open(QIODevice::WriteOnly) || namedObject.write(
+        "v 0 0 0\nv 2 0 0\nv 2 0 2\nv 0 0 2\n"
+        "v 0 1 2\nv 2 1 2\n"
+        "g NAMED-IN-FR-01\nf 1 2 3\nf 1 3 4\n"
+        "g NAMED-CAP-TP-01\nf 4 3 6\nf 4 6 5\n") < 0) return 21;
+    namedObject.close();
+    const QByteArray drawingDxf =
+        "0\nSECTION\n2\nENTITIES\n0\nPOLYLINE\n"
+        "0\nVERTEX\n10\n0\n20\n0\n30\n0\n"
+        "0\nVERTEX\n10\n2\n20\n0\n30\n0\n"
+        "0\nVERTEX\n10\n2\n20\n0\n30\n2\n"
+        "0\nVERTEX\n10\n0\n20\n0\n30\n2\n"
+        "0\nSEQEND\n0\nENDSEC\n0\nEOF\n";
+    for (const auto &name : {"NAMED-IN-FR", "NAMED-TP"}) {
+        QFile map(temporary.filePath(QStringLiteral("map/NAMED/") + QLatin1StringView(name) + QStringLiteral(".dxf")));
+        if (!map.open(QIODevice::WriteOnly) || map.write(drawingDxf) < 0) return 22;
+    }
+    InspectionMapEngine inferred;
+    if (!inferred.load(temporary.path(), &error)) return 23;
+    const auto *front = inferred.drawingForFace(QStringLiteral("NAMED-IN-FR-01"));
+    const auto *top = inferred.drawingForFace(QStringLiteral("NAMED-CAP-TP-01"));
+    if (!front || front->id != QStringLiteral("NAMED-IN-FR") ||
+        !top || top->id != QStringLiteral("NAMED-TP") ||
+        inferred.drawingForFace(QStringLiteral("NAMED-IN-FR-99"))) return 24;
+    QVector3D inferredPoint;
+    if (!inferred.mapPoint(front->id, QStringLiteral("NAMED-IN-FR-01"), QPointF(1, -1), &inferredPoint) ||
+        (inferredPoint - QVector3D(1, 0, 1)).length() > 0.001f) return 25;
     return 0;
 }

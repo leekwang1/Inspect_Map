@@ -22,6 +22,18 @@ struct RegistrationMetrics {
     int samples = 0;
 };
 
+struct OrientationCandidate {
+    int angleDegrees = 0;
+    vtkSmartPointer<vtkMatrix4x4> matrix;
+    RegistrationMetrics metrics;
+    int iterations = 0;
+};
+
+struct OrientationComparison {
+    QVector<OrientationCandidate> candidates;
+    int suggestedIndex = -1;
+};
+
 class RegistrationEngine {
 public:
     static bool loadModel(const QString &root, double fallbackScale,
@@ -31,6 +43,8 @@ public:
                           bool allowScale, vtkMatrix4x4 *matrix, double *rmse, QString *error);
     static bool icp(vtkPolyData *source, vtkPolyData *target, vtkMatrix4x4 *initial,
                     bool allowScale, vtkMatrix4x4 *matrix, int *iterations, QString *error);
+    static bool compareOrientations(vtkPolyData *source, vtkPolyData *target, vtkMatrix4x4 *initial,
+                                    bool allowScale, OrientationComparison *result, QString *error);
     static RegistrationMetrics measure(vtkPolyData *source, vtkPolyData *target,
                                        vtkMatrix4x4 *matrix, double thresholdMeters = 0.5);
     static QVector3D transformPoint(vtkMatrix4x4 *matrix, const QVector3D &point);

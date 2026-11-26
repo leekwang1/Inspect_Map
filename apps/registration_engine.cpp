@@ -293,6 +293,66 @@ bool RegistrationEngine::icp(vtkPolyData *source, vtkPolyData *target,
     return true;
 }
 
+bool RegistrationEngine::compareOrientations(vtkPolyData *source, vtkPolyData *target,
+                                             vtkMatrix4x4 *initial, bool allowScale,
+                                             OrientationComparison *result, QString *error) {
+    if (!result || !source || !target || source->GetNumberOfPoints() < 3 ||
+        target->GetNumberOfCells() < 3) {
+        if (error) *error = QStringLiteral("Point cloud and model are required for orientation comparison.");
+        return false;
+    }
+    result->candidates.clear();
+    result->suggestedIndex = -1;
+    const auto centroid = [](vtkPolyData *data) {
+        QVector3D center;
+        double point[3];
+        for (vtkIdType i = 0; i < data->GetNumberOfPoints(); ++i) {
+            data->GetPoint(i, point);
+            center += QVector3D(float(point[0]), float(point[1]), float(point[2]));
+        }
+        return center / float(data->GetNumberOfPoints());
+    };
+    const QVector3D targetCenter = centroid(target);
+    vtkNew<vtkMatrix4x4> base;
+    if (initial) base->DeepCopy(initial);
+    else {
+        const QVector3D sourceCenter = centroid(source);
+        for (int axis = 0; axis < 3; ++axis)
+            base->SetElement(axis, 3, targetCenter[axis] - sourceCenter[axis]);
+    }
+    QMatrix4x4 halfTurn;
+    halfTurn.translate(targetCenter);
+    halfTurn.rotate(180.0f, 0, 0, 1);
+    halfTurn.translate(-targetCenter);
+    vtkNew<vtkMatrix4x4> flip;
+    for (int row = 0; row < 4; ++row)
+        for (int col = 0; col < 4; ++col)
+            flip->SetElement(row, col, halfTurn(row, col));
+    vtkNew<vtkMatrix4x4> flippedStart;
+    vtkMatrix4x4::Multiply4x4(flip, base, flippedStart);
+    for (int index = 0; index < 2; ++index) {
+        auto matrix = vtkSmartPointer<vtkMatrix4x4>::New();
+        int iterations = 0;
+        QString candidateError;
+        if (!icp(source, target, index == 0 ? base.GetPointer() : flippedStart.GetPointer(),
+                 allowScale, matrix, &iterations, &candidateError)) {
+            if (error) *error = candidateError;
+            result->candidates.clear();
+            return false;
+        }
+        result->candidates.append({index * 180, matrix, measure(source, target, matrix), iterations});
+    }
+    const auto &first = result->candidates[0].metrics;
+    const auto &second = result->candidates[1].metrics;
+    const int winner = first.overlap >= second.overlap ? 0 : 1;
+    const auto &better = result->candidates[winner].metrics;
+    const auto &other = result->candidates[1-winner].metrics;
+    if (better.overlap >= 0.5 && better.overlap-other.overlap >= 0.10 &&
+        better.rmse <= other.rmse + 0.025)
+        result->suggestedIndex = winner;
+    return true;
+}
+
 RegistrationMetrics RegistrationEngine::measure(vtkPolyData *source, vtkPolyData *target,
                                                 vtkMatrix4x4 *matrix, double thresholdMeters) {
     RegistrationMetrics metrics;
