@@ -101,14 +101,8 @@ WorkCounts readWorkCounts(const QString &projectDb, const QString &inspectionId)
                     "AND (?='' OR d.inspection_id=? OR d.inspection_id IS NULL)"));
             }
             if (tables.contains(QStringLiteral("registration_result"))) {
-                if (db.record(QStringLiteral("registration_result")).indexOf(QStringLiteral("inspection_id")) >= 0)
-                    result.registrations = count(QStringLiteral("SELECT count(*) FROM registration_result r "
-                        "WHERE r.active=1 AND (?='' OR r.inspection_id=? OR r.inspection_id IS NULL)"));
-                else {
-                    QSqlQuery query(db);
-                    if (query.exec(QStringLiteral("SELECT count(*) FROM registration_result WHERE active=1")) && query.next())
-                        result.registrations = query.value(0).toInt();
-                }
+                result.registrations = count(QStringLiteral("SELECT count(*) FROM registration_result r "
+                    "WHERE r.active=1 AND (?='' OR r.inspection_id=? OR r.inspection_id IS NULL)"));
             }
             if (tables.contains(QStringLiteral("damage_result"))) {
                 result.damageImages = count(QStringLiteral("SELECT count(*) FROM damage_result r "
@@ -118,14 +112,10 @@ WorkCounts readWorkCounts(const QString &projectDb, const QString &inspectionId)
                     "JOIN damage_result r ON r.result_id=o.result_id JOIN dataset d ON d.dataset_id=r.dataset_id "
                     "WHERE r.active=1 AND o.review_state!='REJECTED' AND substr(o.type,1,7)!='target_' "
                     "AND (?='' OR d.inspection_id=? OR d.inspection_id IS NULL)"));
-                const bool tracksReview = db.record(QStringLiteral("damage_object"))
-                    .indexOf(QStringLiteral("review_confirmed")) >= 0;
                 result.damagePending = count(QStringLiteral("SELECT count(*) FROM damage_object o "
                     "JOIN damage_result r ON r.result_id=o.result_id JOIN dataset d ON d.dataset_id=r.dataset_id "
-                    "WHERE r.active=1 AND ") +
-                    (tracksReview ? QStringLiteral("(o.review_confirmed=0 OR o.review_state='HOLD') ") :
-                        QStringLiteral("o.review_state IN ('UNREVIEWED','HOLD') ")) +
-                    QStringLiteral("AND substr(o.type,1,7)!='target_' "
+                    "WHERE r.active=1 AND (o.review_confirmed=0 OR o.review_state='HOLD') "
+                    "AND substr(o.type,1,7)!='target_' "
                     "AND (?='' OR d.inspection_id=? OR d.inspection_id IS NULL)"));
             }
             if (tables.contains(QStringLiteral("map_projection_run")) &&

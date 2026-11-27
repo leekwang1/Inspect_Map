@@ -91,28 +91,6 @@ bool DamageStore::ensureSchema(const QString &projectDb, QString *error) {
                 return false;
             }
         }
-        if (db.record(QStringLiteral("damage_result")).indexOf(QStringLiteral("initial_review_policy")) < 0) {
-            QSqlQuery alter(db);
-            if (!alter.exec(QStringLiteral("ALTER TABLE damage_result ADD COLUMN "
-                    "initial_review_policy INTEGER NOT NULL DEFAULT 0"))) {
-                if (error) *error = alter.lastError().text();
-                return false;
-            }
-        }
-        if (db.record(QStringLiteral("damage_object")).indexOf(QStringLiteral("review_confirmed")) < 0) {
-            QSqlQuery alter(db);
-            if (!alter.exec(QStringLiteral("ALTER TABLE damage_object ADD COLUMN "
-                    "review_confirmed INTEGER NOT NULL DEFAULT 0"))) {
-                if (error) *error = alter.lastError().text();
-                return false;
-            }
-            QSqlQuery reviewed(db);
-            if (!reviewed.exec(QStringLiteral("UPDATE damage_object SET review_confirmed=1 "
-                    "WHERE review_state!='UNREVIEWED'"))) {
-                if (error) *error = reviewed.lastError().text();
-                return false;
-            }
-        }
         QSqlQuery oldResults(db);
         if (!oldResults.exec(QStringLiteral("SELECT result_id FROM damage_result "
                 "WHERE active=1 AND initial_review_policy=0"))) {

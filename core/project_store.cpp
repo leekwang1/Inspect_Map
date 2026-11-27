@@ -426,42 +426,6 @@ bool ProjectStore::updateInspection(const QString &path, const InspectionInfo &b
     });
 }
 
-bool ProjectStore::backup(const QString &path, const QString &destination, QString *error) {
-    if (QFileInfo::exists(destination) || QFileInfo(destination).absoluteFilePath() == QFileInfo(path).absoluteFilePath()) {
-        if (error) *error = QStringLiteral("Backup destination already exists or matches the project database.");
-        return false;
-    }
-    return withDatabase(path, true, error, [&](QSqlDatabase &db) {
-        QSqlQuery query(db);
-        query.prepare(QStringLiteral("VACUUM INTO ?"));
-        query.addBindValue(destination);
-        if (query.exec()) return true;
-        if (error) *error = query.lastError().text();
-        return false;
-    });
-}
-
-bool ProjectStore::integrityCheck(const QString &path, QString *result, QString *error) {
-    if (!result) return false;
-    return withDatabase(path, true, error, [&](QSqlDatabase &db) {
-        QSqlQuery integrity(db);
-        if (!integrity.exec(QStringLiteral("PRAGMA integrity_check")) || !integrity.next()) {
-            if (error) *error = integrity.lastError().text();
-            return false;
-        }
-        const QString value = integrity.value(0).toString();
-        QSqlQuery foreignKeys(db);
-        if (!foreignKeys.exec(QStringLiteral("PRAGMA foreign_key_check"))) {
-            if (error) *error = foreignKeys.lastError().text();
-            return false;
-        }
-        const bool fkError = foreignKeys.next();
-        *result = QStringLiteral("SQLite integrity: %1\nForeign keys: %2")
-            .arg(value, fkError ? QStringLiteral("error") : QStringLiteral("ok"));
-        return value == QStringLiteral("ok") && !fkError;
-    });
-}
-
 bool ProjectStore::ensureManagerSchema(const QString &path, QString *error) {
     int version = 0;
     const bool checked = withDatabase(path, true, error, [&](QSqlDatabase &db) {
@@ -474,48 +438,10 @@ bool ProjectStore::ensureManagerSchema(const QString &path, QString *error) {
         return true;
     });
     if (!checked) return false;
-    if (version > 4) {
-        if (error) *error = QStringLiteral("Project database is newer than this application.");
-        return false;
-    }
-    if (version >= 4) return true;
-    if (version != 1 && version != 2 && version != 3) {
-        if (error) *error = QStringLiteral("Unsupported project database version.");
-        return false;
-    }
-    const auto backupPath = QFileInfo(path).absoluteDir().filePath(
-        QStringLiteral("project-before-v%1-%2.sqlite").arg(version + 1).arg(QUuid::createUuid().toString(QUuid::WithoutBraces)));
-    if (!backup(path, backupPath, error)) return false;
-    const bool migrated = withDatabase(path, false, error, [&](QSqlDatabase &db) {
-        if (!db.transaction()) { if (error) *error = db.lastError().text(); return false; }
-        QSqlQuery query(db);
-        const QStringList statements = version == 1 ? QStringList{
-            QStringLiteral("CREATE TABLE pipeline_setting (module_id TEXT PRIMARY KEY, execution_mode TEXT NOT NULL CHECK(execution_mode IN ('AUTO','REVIEW','MANUAL','SKIP')))")
-        } : version == 2 ? QStringList{
-            QStringLiteral("CREATE TABLE module_run (run_id TEXT PRIMARY KEY, inspection_id TEXT REFERENCES inspection(inspection_id), module_id TEXT NOT NULL, status TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT, error_message TEXT NOT NULL DEFAULT '')"),
-            QStringLiteral("CREATE INDEX module_run_scope ON module_run(inspection_id,module_id,started_at)"),
-            QStringLiteral("CREATE TABLE artifact (artifact_id TEXT PRIMARY KEY, created_by_run_id TEXT NOT NULL REFERENCES module_run(run_id), artifact_type TEXT NOT NULL, storage_path TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 0 CHECK(is_active IN (0,1)))"),
-            QStringLiteral("CREATE TABLE artifact_dependency (parent_artifact_id TEXT NOT NULL REFERENCES artifact(artifact_id), child_artifact_id TEXT NOT NULL REFERENCES artifact(artifact_id), PRIMARY KEY(parent_artifact_id,child_artifact_id))")
-        } : QStringList{
-            QStringLiteral("CREATE TABLE facility_input (facility_id TEXT PRIMARY KEY REFERENCES facility(facility_id), model_root TEXT NOT NULL)"),
-            QStringLiteral("CREATE TABLE inspection_input (inspection_id TEXT PRIMARY KEY REFERENCES inspection(inspection_id), cloud_path TEXT NOT NULL)")
-        };
-        bool ok = true;
-        for (const auto &sql : statements) if (!query.exec(sql)) { ok = false; break; }
-        if (ok) {
-            query.prepare(QStringLiteral("INSERT INTO schema_version VALUES(?,?,?,?)"));
-            query.addBindValue(version + 1);
-            query.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
-            query.addBindValue(QStringLiteral("0.1.0"));
-            query.addBindValue(QStringLiteral("bootstrap-v%1").arg(version + 1));
-            ok = query.exec();
-        }
-        if (ok && db.commit()) return true;
-        if (error) *error = ok ? db.lastError().text() : query.lastError().text();
-        db.rollback();
-        return false;
-    });
-    return migrated && ensureManagerSchema(path, error);
+    if (version == 4) return true;
+    if (error) *error = version > 4 ? QStringLiteral("Project database is newer than this application.") :
+        QStringLiteral("Unsupported project database version. Create a new project.");
+    return false;
 }
 
 bool ProjectStore::pipelineModes(const QString &path, QMap<QString, QString> *modes, QString *error) {
@@ -637,19 +563,6 @@ bool ProjectStore::ensureRegistrationSchema(const QString &path, QString *error)
             "overlap REAL, icp_iterations INTEGER, pose_frame_confirmed INTEGER NOT NULL, "
             "created_at TEXT NOT NULL, active INTEGER NOT NULL, survey_side TEXT NOT NULL DEFAULT '', "
             "review_status TEXT NOT NULL DEFAULT 'CONFIRMED', confirmed_at TEXT, run_id TEXT)"), error);
-        const auto columns = db.record(QStringLiteral("registration_result"));
-        const struct { const char *name; const char *definition; } additions[] = {
-            {"survey_side", "survey_side TEXT NOT NULL DEFAULT ''"},
-            {"inspection_id", "inspection_id TEXT"},
-            {"review_status", "review_status TEXT NOT NULL DEFAULT 'CONFIRMED'"},
-            {"confirmed_at", "confirmed_at TEXT"},
-            {"run_id", "run_id TEXT"}
-        };
-        for (const auto &column : additions) {
-            if (ok && columns.indexOf(QString::fromLatin1(column.name)) < 0)
-                ok = execute(db, QStringLiteral("ALTER TABLE registration_result ADD COLUMN ") +
-                    QString::fromLatin1(column.definition), error);
-        }
         if (ok && db.commit()) return true;
         if (ok && error) *error = db.lastError().text();
         db.rollback();
@@ -662,8 +575,7 @@ bool ProjectStore::pendingRegistrations(const QString &path, const QString &insp
     if (!items) return false;
     items->clear();
     return withDatabase(path, true, error, [&](QSqlDatabase &db) {
-        if (!db.tables().contains(QStringLiteral("registration_result")) ||
-            db.record(QStringLiteral("registration_result")).indexOf(QStringLiteral("review_status")) < 0)
+        if (!db.tables().contains(QStringLiteral("registration_result")))
             return true;
         QSqlQuery query(db);
         query.prepare(QStringLiteral("SELECT registration_id,inspection_id,dataset_id,source_cloud_path,"

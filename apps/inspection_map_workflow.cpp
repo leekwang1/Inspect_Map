@@ -359,15 +359,14 @@ bool InspectionMapWorkflow::ensureSchema(const QString &projectDb, QString *erro
                 "image_name TEXT NOT NULL, type TEXT NOT NULL, part_id TEXT NOT NULL, "
                 "face_id TEXT NOT NULL, drawing_id TEXT NOT NULL, status TEXT NOT NULL, "
                 "reason TEXT NOT NULL, paths_json TEXT NOT NULL, length_mm REAL NOT NULL, "
-                "area_mm2 REAL NOT NULL)"),
+                "area_mm2 REAL NOT NULL, box_width_mm REAL NOT NULL DEFAULT 0, "
+                "box_length_mm REAL NOT NULL DEFAULT 0, crack_p90_mm REAL NOT NULL DEFAULT 0)"),
             QStringLiteral("CREATE INDEX IF NOT EXISTS idx_map_projection_item_run "
                 "ON map_projection_item(run_id,part_id)"),
             QStringLiteral("CREATE TABLE IF NOT EXISTS map_projection_review ("
                 "run_id TEXT NOT NULL REFERENCES map_projection_run(run_id), "
                 "object_id TEXT NOT NULL REFERENCES damage_object(object_id), "
-                "decision TEXT NOT NULL, part_id TEXT NOT NULL DEFAULT '', face_id TEXT NOT NULL DEFAULT '', "
-                "drawing_id TEXT NOT NULL DEFAULT '', paths_json TEXT NOT NULL DEFAULT '[]', "
-                "length_mm REAL NOT NULL DEFAULT 0, area_mm2 REAL NOT NULL DEFAULT 0, "
+                "decision TEXT NOT NULL CHECK(decision IN ('EXCLUDED','DEFERRED')), "
                 "updated_at TEXT NOT NULL, PRIMARY KEY(run_id,object_id))"),
             QStringLiteral("CREATE TABLE IF NOT EXISTS map_damage_group ("
                 "group_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES map_projection_run(run_id), "
@@ -380,14 +379,6 @@ bool InspectionMapWorkflow::ensureSchema(const QString &projectDb, QString *erro
         };
         for (const auto &statement : statements) if (!query.exec(statement)) {
             if (error) *error = query.lastError().text(); return false;
-        }
-        for (const auto &column : {QStringLiteral("box_width_mm"), QStringLiteral("box_length_mm"),
-                                    QStringLiteral("crack_p90_mm")}) {
-            if (db.record(QStringLiteral("map_projection_item")).indexOf(column) >= 0) continue;
-            if (!query.exec(QStringLiteral("ALTER TABLE map_projection_item ADD COLUMN %1 REAL NOT NULL DEFAULT 0")
-                            .arg(column))) {
-                if (error) *error = query.lastError().text(); return false;
-            }
         }
         return true;
     });
@@ -504,8 +495,7 @@ bool InspectionMapWorkflow::active(const QString &projectDb, const QString &insp
         QHash<QString, int> byObject;
         for (int i = 0; i < batch->items.size(); ++i) byObject.insert(batch->items[i].objectId, i);
         QSqlQuery reviews(db);
-        reviews.prepare(QStringLiteral("SELECT object_id,decision,part_id,face_id,drawing_id,paths_json,"
-            "length_mm,area_mm2 FROM map_projection_review WHERE run_id=?"));
+        reviews.prepare(QStringLiteral("SELECT object_id,decision FROM map_projection_review WHERE run_id=?"));
         reviews.addBindValue(batch->runId);
         if (!exec(reviews, error)) return false;
         while (reviews.next()) {
@@ -513,14 +503,7 @@ bool InspectionMapWorkflow::active(const QString &projectDb, const QString &insp
             if (index < 0) continue;
             auto &item = batch->items[index];
             item.reviewState = reviews.value(1).toString();
-            if (item.reviewState == QStringLiteral("CORRECTED")) {
-                item.partId = reviews.value(2).toString(); item.faceId = reviews.value(3).toString();
-                item.drawingId = reviews.value(4).toString();
-                item.paths = readPaths(reviews.value(5).toByteArray());
-                item.lengthMm = reviews.value(6).toDouble(); item.areaMm2 = reviews.value(7).toDouble();
-                if (item.lengthMm > 0) item.boxLengthMm = item.lengthMm;
-                item.status = QStringLiteral("PROJECTED"); item.reason = QStringLiteral("수동 위치·물량 확정");
-            } else if (item.reviewState == QStringLiteral("EXCLUDED")) {
+            if (item.reviewState == QStringLiteral("EXCLUDED")) {
                 item.status = QStringLiteral("EXCLUDED"); item.reason = QStringLiteral("망도 검토 제외");
                 item.lengthMm = 0; item.areaMm2 = 0;
             }
@@ -579,53 +562,11 @@ bool InspectionMapWorkflow::active(const QString &projectDb, const QString &insp
 }
 
 bool InspectionMapWorkflow::review(const QString &projectDb, const QString &runId,
-                                   const QString &objectId, const InspectionMapEngine &engine,
-                                   const QString &decision,
-                                   const ProjectedDamage *corrected, QString *error) {
+                                   const QString &objectId, const QString &decision, QString *error) {
     if (runId.isEmpty() || objectId.isEmpty() ||
         !QStringList{QStringLiteral("RESET"), QStringLiteral("EXCLUDED"),
-                     QStringLiteral("DEFERRED"), QStringLiteral("CORRECTED")}.contains(decision)) {
+                     QStringLiteral("DEFERRED")}.contains(decision)) {
         if (error) *error = QStringLiteral("검토 대상 또는 판정이 유효하지 않습니다."); return false;
-    }
-    if (decision == QStringLiteral("CORRECTED") &&
-        (!corrected || corrected->partId.isEmpty() || corrected->faceId.isEmpty() ||
-         corrected->drawingId.isEmpty() || corrected->paths.isEmpty() ||
-         (corrected->lengthMm <= 0 && corrected->areaMm2 <= 0))) {
-        if (error) *error = QStringLiteral("확정할 3D 형상과 물량이 필요합니다."); return false;
-    }
-    if (decision == QStringLiteral("CORRECTED")) {
-        const auto *drawing = engine.drawing(corrected->drawingId);
-        if (!drawing || drawing->partId != corrected->partId ||
-            !drawing->faceIds.contains(corrected->faceId) || corrected->paths.size() != 1) {
-            if (error) *error = QStringLiteral("선택한 부재·도면·면이 일치하지 않습니다."); return false;
-        }
-        const auto &path = corrected->paths.first();
-        const bool area = corrected->areaMm2 > 0;
-        if (path.size() < (area ? 3 : 2) ||
-            (area && corrected->lengthMm != 0) || (!area && corrected->areaMm2 != 0)) {
-            if (error) *error = QStringLiteral("선 또는 영역 형식이 유효하지 않습니다."); return false;
-        }
-        for (const auto &world : path) {
-            QVector3D recovered;
-            if (!engine.mapPoint(corrected->drawingId, corrected->faceId,
-                                 InspectionMapEngine::drawingPoint(*drawing, world), &recovered) ||
-                (recovered-world).length() > 0.01f) {
-                if (error) *error = QStringLiteral("선택한 모델 면을 벗어난 점이 있습니다."); return false;
-            }
-        }
-        double measured = 0;
-        if (area) {
-            QVector3D cross;
-            for (int i = 0; i < path.size(); ++i)
-                cross += QVector3D::crossProduct(path[i], path[(i+1)%path.size()]);
-            measured = 500000.0 * double(cross.length());
-        } else for (int i = 1; i < path.size(); ++i)
-            measured += 1000.0 * double((path[i]-path[i-1]).length());
-        const double submitted = area ? corrected->areaMm2 : corrected->lengthMm;
-        if (!std::isfinite(measured) || measured <= 0 ||
-            std::abs(measured-submitted) > std::max(0.01, measured*0.0001)) {
-            if (error) *error = QStringLiteral("3D 형상과 물량값이 일치하지 않습니다."); return false;
-        }
     }
     if (!ensureSchema(projectDb, error)) return false;
     return withDb(projectDb, error, [&](QSqlDatabase &db) {
@@ -651,18 +592,10 @@ bool InspectionMapWorkflow::review(const QString &projectDb, const QString &runI
             query.addBindValue(runId); query.addBindValue(objectId);
         } else {
             query.prepare(QStringLiteral("INSERT INTO map_projection_review "
-                "(run_id,object_id,decision,part_id,face_id,drawing_id,paths_json,length_mm,area_mm2,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(run_id,object_id) DO UPDATE SET "
-                "decision=excluded.decision,part_id=excluded.part_id,face_id=excluded.face_id,"
-                "drawing_id=excluded.drawing_id,paths_json=excluded.paths_json,"
-                "length_mm=excluded.length_mm,area_mm2=excluded.area_mm2,updated_at=excluded.updated_at"));
+                "(run_id,object_id,decision,updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(run_id,object_id) DO UPDATE SET "
+                "decision=excluded.decision,updated_at=excluded.updated_at"));
             query.addBindValue(runId); query.addBindValue(objectId); query.addBindValue(decision);
-            query.addBindValue(corrected ? corrected->partId : QStringLiteral(""));
-            query.addBindValue(corrected ? corrected->faceId : QStringLiteral(""));
-            query.addBindValue(corrected ? corrected->drawingId : QStringLiteral(""));
-            query.addBindValue(corrected ? json(pathsJson(corrected->paths)) : QStringLiteral("[]"));
-            query.addBindValue(corrected ? corrected->lengthMm : 0.0);
-            query.addBindValue(corrected ? corrected->areaMm2 : 0.0);
             query.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
         }
         return exec(query, error);

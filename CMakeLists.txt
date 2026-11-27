@@ -36,7 +36,7 @@ set_target_properties(OpenCVWorld PROPERTIES
     IMPORTED_LOCATION_RELEASE "${OpenCV_RELEASE_DLL}"
     IMPORTED_LOCATION_DEBUG "${OpenCV_DEBUG_DLL}")
 
-add_library(InspectCore STATIC core/project_store.cpp core/project_store.h core/project_archive.cpp core/project_archive.h
+add_library(InspectCore STATIC core/project_store.cpp core/project_store.h
     core/conversion_core.cpp core/conversion_core.h core/input_adapters.cpp core/input_adapters.h
     core/image_correction.cpp core/image_correction.h core/damage_store.cpp core/damage_store.h)
 target_link_libraries(InspectCore PUBLIC Qt6::Core Qt6::Gui Qt6::Sql OpenCVWorld)

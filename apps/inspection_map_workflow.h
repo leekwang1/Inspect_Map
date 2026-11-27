@@ -43,8 +43,7 @@ public:
     static bool active(const QString &projectDb, const QString &inspectionId, const QString &datasetId,
                        ProjectionBatch *batch, QString *error);
     static bool review(const QString &projectDb, const QString &runId, const QString &objectId,
-                       const InspectionMapEngine &engine,
-                       const QString &decision, const ProjectedDamage *corrected, QString *error);
+                       const QString &decision, QString *error);
     static bool group(const QString &projectDb, const QString &runId, const QStringList &objectIds,
                       const QString &representativeId, const QString &kind, QString *error);
     static bool ungroup(const QString &projectDb, const QString &runId,

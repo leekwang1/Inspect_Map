@@ -60,13 +60,6 @@ QString imageStorageName(const QString &flightId, const QString &fileName) {
     return safeSegment(flightId) + QStringLiteral("/") + safeSegment(fileName);
 }
 
-bool hasColumn(QSqlDatabase &db, const QString &table, const QString &column) {
-    QSqlQuery query(db);
-    if (!query.exec(QStringLiteral("PRAGMA table_info(%1)").arg(table))) return false;
-    while (query.next()) if (query.value(1).toString() == column) return true;
-    return false;
-}
-
 bool execute(QSqlDatabase &db, const QString &statement, QString *error) {
     QSqlQuery query(db);
     if (query.exec(statement)) return true;
@@ -111,21 +104,6 @@ bool ConversionCore::ensureSchema(const QString &projectDb, QString *error) {
                 };
                 ok = true;
                 for (const auto &statement : statements) if (!execute(db, statement, error)) { ok = false; break; }
-                if (ok && !hasColumn(db, QStringLiteral("image"), QStringLiteral("display_name")))
-                    ok = execute(db, QStringLiteral("ALTER TABLE image ADD COLUMN display_name TEXT"), error);
-                if (ok && !hasColumn(db, QStringLiteral("image"), QStringLiteral("capture_time")))
-                    ok = execute(db, QStringLiteral("ALTER TABLE image ADD COLUMN capture_time INTEGER"), error);
-                if (ok) {
-                    QSqlQuery version(db);
-                    if (version.exec(QStringLiteral("SELECT max(version) FROM schema_version")) && version.next() && version.value(0).toInt() < 4) {
-                        version.prepare(QStringLiteral("INSERT INTO schema_version VALUES(4,?,?,?)"));
-                        version.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
-                        version.addBindValue(QStringLiteral("0.1.0"));
-                        version.addBindValue(QStringLiteral("conversion-v1"));
-                        ok = version.exec();
-                        if (!ok && error) *error = version.lastError().text();
-                    }
-                }
                 if (ok) ok = db.commit(); else db.rollback();
             } else if (error) *error = db.lastError().text();
             db.close();

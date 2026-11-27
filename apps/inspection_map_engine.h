@@ -34,26 +34,6 @@ struct MapHit {
     double distance = 0;
 };
 
-struct UnrollStrip {
-    QString faceId;
-    QVector3D start;
-    QVector3D end;
-    double offset = 0;
-    double width = 0;
-    double bottom = 0;
-    double top = 0;
-    bool interior = false;
-};
-
-struct UnrollChart {
-    QString partId;
-    QVector<UnrollStrip> strips;
-    QStringList excludedFaces;
-    double exteriorWidth = 0;
-    double interiorWidth = 0;
-    bool point(const QString &faceId, const QVector3D &world, QPointF *unrolled) const;
-};
-
 struct UnrollTriangle {
     MapTriangle source;
     QPointF a, b, c;
@@ -71,7 +51,6 @@ struct UnrollSheet {
     QString id;
     QString series;
     QString side;
-    bool sourceDxf = false;
     QVector<UnrollFace> faces;
     QStringList parts;
     bool point(const QString &faceId, const QVector3D &world, QPointF *unrolled) const;
@@ -85,9 +64,6 @@ public:
     const QList<MapDrawing> &drawings() const { return drawings_; }
     const MapDrawing *drawing(const QString &id) const;
     const MapDrawing *drawingForFace(const QString &faceId) const;
-    bool mapPoint(const QString &drawingId, const QString &faceId, const QPointF &point,
-                  QVector3D *world) const;
-    UnrollChart unroll(const QString &partId) const;
     const QList<UnrollSheet> &unrollSheets() const { return unrollSheets_; }
     const UnrollSheet *unrollSheet(const QString &id) const;
     static QPointF drawingPoint(const MapDrawing &drawing, const QVector3D &point);

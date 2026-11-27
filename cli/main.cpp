@@ -1,5 +1,4 @@
 #include "project_store.h"
-#include "project_archive.h"
 #include "conversion_core.h"
 #include "image_correction.h"
 #include "damage_store.h"
@@ -297,7 +296,6 @@ int main(int argc, char *argv[]) {
         QList<FacilityInfo> facilities;
         QList<InspectionInfo> inspections;
         const auto path = ProjectStore::databasePath(temp.path());
-        const auto backupPath = temp.filePath(QStringLiteral("backup.sqlite"));
         if (!temp.isValid() || !ProjectStore::create(temp.path(), QStringLiteral("Smoke Test"), &error)
             || !ProjectStore::read(path, &info, &error)
             || info.name != QStringLiteral("Smoke Test")
@@ -319,10 +317,8 @@ int main(int argc, char *argv[]) {
             || ProjectStore::updateFacility(path, facilities[0], updatedFacility, &error)
             || !ProjectStore::updateInspection(path, inspections[0], updatedInspection, &error)
             || !ProjectStore::ensureManagerSchema(path, &error)
-            || !ProjectStore::setPipelineMode(path, QStringLiteral("sfm"), QStringLiteral("SKIP"), &error)
-            || !ProjectStore::backup(path, backupPath, &error)
-            || !ProjectStore::read(backupPath, &info, &error)) {
-            err << "self-test edit/backup failed: " << error << Qt::endl;
+            || !ProjectStore::setPipelineMode(path, QStringLiteral("sfm"), QStringLiteral("SKIP"), &error)) {
+            err << "self-test edit failed: " << error << Qt::endl;
             return 1;
         }
         FacilityInfo detailedFacility{{}, QStringLiteral("Bridge B"), QStringLiteral("Bridge"),
@@ -343,11 +339,9 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         QMap<QString, QString> modes;
-        QString integrity;
         if (!ProjectStore::pipelineModes(path, &modes, &error)
-            || modes.value(QStringLiteral("sfm")) != QStringLiteral("SKIP")
-            || !ProjectStore::integrityCheck(path, &integrity, &error)) {
-            err << "self-test pipeline/integrity failed: " << error << " " << integrity << Qt::endl;
+            || modes.value(QStringLiteral("sfm")) != QStringLiteral("SKIP")) {
+            err << "self-test pipeline failed: " << error << Qt::endl;
             return 1;
         }
         const auto firstRunId = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -565,57 +559,6 @@ int main(int argc, char *argv[]) {
                 db.close();
             }
             QSqlDatabase::removeDatabase(connection);
-        }
-        QTemporaryDir archive;
-        QTemporaryDir restored;
-        ProjectInfo restoredInfo;
-        if (!archive.isValid() || !restored.isValid()
-            || !ProjectArchive::backupProject(path, archive.path(), &error)
-            || !ProjectArchive::restoreProject(archive.path(), restored.path(), &error)
-            || !ProjectStore::read(ProjectStore::databasePath(restored.path()), &restoredInfo, &error)
-            || restoredInfo.id != info.id || !QFileInfo::exists(restored.filePath(QStringLiteral("fixture.txt")))) {
-            err << "project archive test failed: " << error << Qt::endl;
-            return 1;
-        }
-        QFile tamper(archive.filePath(QStringLiteral("fixture.txt")));
-        QTemporaryDir rejected;
-        if (!tamper.open(QIODevice::Append) || tamper.write("changed") != 7) return 1;
-        tamper.close();
-        error.clear();
-        if (ProjectArchive::restoreProject(archive.path(), rejected.path(), &error) ||
-            !QDir(rejected.path()).entryList(QDir::AllEntries | QDir::NoDotAndDotDot).isEmpty()) {
-            err << "tampered archive was accepted" << Qt::endl;
-            return 1;
-        }
-        QTemporaryDir legacy;
-        const auto legacyPath = ProjectStore::databasePath(legacy.path());
-        if (!legacy.isValid() || !ProjectStore::create(legacy.path(), QStringLiteral("Legacy"), &error)) {
-            err << "legacy fixture failed: " << error << Qt::endl;
-            return 1;
-        }
-        {
-            auto db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), QStringLiteral("legacy-test"));
-            db.setDatabaseName(legacyPath);
-            if (!db.open()) return 1;
-            QSqlQuery query(db);
-            if (!query.exec(QStringLiteral("DROP TABLE artifact_dependency"))
-                || !query.exec(QStringLiteral("DROP TABLE inspection_input"))
-                || !query.exec(QStringLiteral("DROP TABLE facility_input"))
-                || !query.exec(QStringLiteral("DROP TABLE artifact"))
-                || !query.exec(QStringLiteral("DROP TABLE module_run"))
-                || !query.exec(QStringLiteral("DROP TABLE pipeline_setting"))
-                || !query.exec(QStringLiteral("DELETE FROM schema_version"))
-                || !query.exec(QStringLiteral("INSERT INTO schema_version VALUES(1,'2026-01-01','0.1.0','bootstrap-v1')"))) return 1;
-            db.close();
-        }
-        QSqlDatabase::removeDatabase(QStringLiteral("legacy-test"));
-        if (!ProjectStore::ensureManagerSchema(legacyPath, &error)
-            || !ProjectStore::pipelineModes(legacyPath, &modes, &error)
-            || QDir(legacy.path()).entryList({QStringLiteral("project-before-v2-*.sqlite")}, QDir::Files).size() != 1
-            || QDir(legacy.path()).entryList({QStringLiteral("project-before-v3-*.sqlite")}, QDir::Files).size() != 1
-            || QDir(legacy.path()).entryList({QStringLiteral("project-before-v4-*.sqlite")}, QDir::Files).size() != 1) {
-            err << "migration failed: " << error << Qt::endl;
-            return 1;
         }
         out << "self-test passed" << Qt::endl;
         return 0;

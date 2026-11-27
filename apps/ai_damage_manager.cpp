@@ -176,6 +176,12 @@ public:
         setDragMode(QGraphicsView::NoDrag);
         viewport()->setCursor(Qt::CrossCursor);
     }
+    void onRegionSelection(std::function<void(const QRectF &)> handler) {
+        selectionHandler_ = std::move(handler);
+    }
+    void onClearSelection(std::function<void()> handler) {
+        clearSelectionHandler_ = std::move(handler);
+    }
 protected:
     void wheelEvent(QWheelEvent *event) override {
         zoom(event->angleDelta().y() > 0 ? 1.2 : 1.0 / 1.2);
@@ -186,10 +192,26 @@ protected:
         if (autoFit_) fitImage();
     }
     void mousePressEvent(QMouseEvent *event) override {
+        if (event->button() == Qt::RightButton && clearSelectionHandler_) {
+            clearSelectionHandler_();
+            event->accept();
+            return;
+        }
         if (regionHandler_ && event->button() == Qt::LeftButton) {
             start_ = event->pos();
             rubber_->setGeometry(QRect(start_, QSize()));
             rubber_->show();
+            return;
+        }
+        if (selectionHandler_ && event->button() == Qt::LeftButton &&
+            event->modifiers().testFlag(Qt::ControlModifier)) {
+            selectionDrag_ = true;
+            start_ = event->pos();
+            setDragMode(QGraphicsView::NoDrag);
+            viewport()->setCursor(Qt::CrossCursor);
+            rubber_->setGeometry(QRect(start_, QSize()));
+            rubber_->show();
+            event->accept();
             return;
         }
         QGraphicsView::mousePressEvent(event);
@@ -199,15 +221,27 @@ protected:
         QGraphicsView::mouseMoveEvent(event);
     }
     void mouseReleaseEvent(QMouseEvent *event) override {
+        if (event->button() == Qt::RightButton && clearSelectionHandler_) {
+            event->accept();
+            return;
+        }
         if (rubber_->isVisible() && event->button() == Qt::LeftButton) {
             const QRect rect = rubber_->geometry();
             rubber_->hide();
             setDragMode(QGraphicsView::ScrollHandDrag);
             viewport()->unsetCursor();
-            auto handler = std::move(regionHandler_);
-            regionHandler_ = {};
-            if (rect.width() > 4 && rect.height() > 4 && handler)
-                handler(mapToScene(rect).boundingRect());
+            const bool selecting = selectionDrag_;
+            selectionDrag_ = false;
+            if (selecting) {
+                if (rect.width() > 4 && rect.height() > 4 && selectionHandler_)
+                    selectionHandler_(mapToScene(rect).boundingRect());
+            } else {
+                auto handler = std::move(regionHandler_);
+                regionHandler_ = {};
+                if (rect.width() > 4 && rect.height() > 4 && handler)
+                    handler(mapToScene(rect).boundingRect());
+            }
+            event->accept();
             return;
         }
         QGraphicsView::mouseReleaseEvent(event);
@@ -217,7 +251,10 @@ private:
     QPoint start_;
     bool autoFit_ = true;
     bool fitting_ = false;
+    bool selectionDrag_ = false;
     std::function<void(const QRectF &)> regionHandler_;
+    std::function<void(const QRectF &)> selectionHandler_;
+    std::function<void()> clearSelectionHandler_;
 };
 
 class DamageWindow : public QMainWindow {
@@ -398,9 +435,23 @@ public:
                 QPointF(bbox[2].toDouble(), bbox[3].toDouble())).normalized()));
         });
         connect(scene_, &QGraphicsScene::selectionChanged, this, [this] {
-            const auto selected = scene_->selectedItems();
-            if (!selected.isEmpty()) objects_->selectRow(selected.first()->data(0).toInt());
+            QSet<int> rows;
+            for (auto *item : scene_->selectedItems())
+                if (item->flags() & QGraphicsItem::ItemIsSelectable) rows.insert(item->data(0).toInt());
+            if (rows.isEmpty()) {
+                selectObject(objects_->currentRow());
+                return;
+            }
+            selectRows(rows);
         });
+        view_->onRegionSelection([this](const QRectF &area) {
+            QSet<int> rows;
+            for (auto *item : scene_->items(area, Qt::IntersectsItemShape, Qt::DescendingOrder,
+                                            view_->viewportTransform()))
+                if (item->flags() & QGraphicsItem::ItemIsSelectable) rows.insert(item->data(0).toInt());
+            selectRows(rows);
+        });
+        view_->onClearSelection([this] { selectRows({}); });
         connect(typeFilter_, &QComboBox::currentIndexChanged, this, [this] { refreshObjects(); });
         connect(reviewFilter_, &QComboBox::currentIndexChanged, this, [this] { refreshObjects(); });
         connect(zoomIn, &QPushButton::clicked, this, [this] { view_->zoom(1.25); });
@@ -580,6 +631,22 @@ private:
         selectObject(objects_->currentRow());
         updateSaveButton();
     }
+    void selectRows(const QSet<int> &rows) {
+        const QSignalBlocker tableBlocker(objects_);
+        const QSignalBlocker selectionBlocker(objects_->selectionModel());
+        objects_->selectionModel()->clearSelection();
+        QList<int> sorted = rows.values();
+        std::sort(sorted.begin(), sorted.end());
+        for (int row : sorted) {
+            if (row < 0 || row >= objectsData_.size()) continue;
+            objects_->selectionModel()->select(objects_->model()->index(row, 0),
+                QItemSelectionModel::Select | QItemSelectionModel::Rows);
+        }
+        const int current = sorted.isEmpty() ? -1 : sorted.first();
+        objects_->selectionModel()->setCurrentIndex(current < 0 ? QModelIndex() :
+            objects_->model()->index(current, 0), QItemSelectionModel::NoUpdate);
+        selectObject(current);
+    }
     void drawObject(const DamageObject &object, int row) {
         const QColor color = colorFor(object);
         auto addPath = [&](const QPainterPath &path, bool filled) {
@@ -616,7 +683,6 @@ private:
         QSet<int> selectedRows;
         for (const auto &index : objects_->selectionModel()->selectedRows())
             if (index.row() >= 0 && index.row() < objectsData_.size()) selectedRows.insert(index.row());
-        if (selectedRows.isEmpty() && row >= 0 && row < objectsData_.size()) selectedRows.insert(row);
         const QSignalBlocker reviewBlocker(review_);
         const QSignalBlocker typeBlocker(type_);
         const QSignalBlocker noteBlocker(note_);
@@ -624,7 +690,16 @@ private:
         const bool single = selectedRows.size() == 1;
         type_->setEnabled(single);
         note_->setEnabled(single);
-        if (selectedRows.isEmpty()) { detail_->clear(); reason_->clear(); return; }
+        if (selectedRows.isEmpty()) {
+            detail_->clear();
+            reason_->clear();
+            const QSignalBlocker blocker(scene_);
+            for (auto *item : scene_->selectedItems()) {
+                item->setSelected(false);
+                item->setZValue(1);
+            }
+            return;
+        }
         if (!selectedRows.contains(row)) row = *selectedRows.begin();
         const auto &object = objectsData_[row];
         if (single) {

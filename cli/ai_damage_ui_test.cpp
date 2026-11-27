@@ -91,6 +91,47 @@ int main(int argc, char *argv[]) {
                 app.exit(15); return;
             }
         }
+        auto *view = static_cast<ImageView *>(window.findChild<QGraphicsView *>());
+        if (!view || view->viewport()->width() < 20 || view->viewport()->height() < 20) {
+            app.exit(16); return;
+        }
+        const QRect area = view->viewport()->rect().adjusted(2, 2, -2, -2);
+        const auto sendMouse = [view](QEvent::Type type, const QPoint &point,
+                                      Qt::MouseButton button, Qt::MouseButtons buttons,
+                                      Qt::KeyboardModifiers modifiers = Qt::ControlModifier) {
+            QMouseEvent event(type, QPointF(point), button, buttons, modifiers);
+            QApplication::sendEvent(view->viewport(), &event);
+        };
+        sendMouse(QEvent::MouseButtonPress, area.topLeft(), Qt::LeftButton, Qt::LeftButton);
+        sendMouse(QEvent::MouseMove, area.bottomRight(), Qt::NoButton, Qt::LeftButton);
+        sendMouse(QEvent::MouseButtonRelease, area.bottomRight(), Qt::LeftButton, Qt::NoButton);
+        QSet<int> selectedInScene;
+        for (auto *item : view->scene()->selectedItems()) selectedInScene.insert(item->data(0).toInt());
+        if (objects->selectionModel()->selectedRows().size() < 2 ||
+            selectedInScene.size() != objects->selectionModel()->selectedRows().size() ||
+            view->dragMode() != QGraphicsView::ScrollHandDrag) { app.exit(17); return; }
+        QPoint emptyPoint;
+        bool foundEmpty = false;
+        for (int y = 4; y < view->viewport()->height() && !foundEmpty; y += 20) {
+            for (int x = 4; x < view->viewport()->width(); x += 20) {
+                const auto hits = view->scene()->items(view->mapToScene(QPoint(x, y)),
+                    Qt::IntersectsItemShape, Qt::DescendingOrder, view->viewportTransform());
+                if (std::none_of(hits.cbegin(), hits.cend(), [](const auto *item) {
+                    return item->flags() & QGraphicsItem::ItemIsSelectable;
+                })) { emptyPoint = QPoint(x, y); foundEmpty = true; break; }
+            }
+        }
+        if (!foundEmpty) { app.exit(18); return; }
+        sendMouse(QEvent::MouseButtonPress, emptyPoint, Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        sendMouse(QEvent::MouseButtonRelease, emptyPoint, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+        if (objects->selectionModel()->selectedRows().size() != selectedInScene.size() ||
+            view->scene()->selectedItems().isEmpty()) { app.exit(19); return; }
+        sendMouse(QEvent::MouseButtonPress, area.center(), Qt::RightButton, Qt::RightButton, Qt::NoModifier);
+        sendMouse(QEvent::MouseButtonRelease, area.center(), Qt::RightButton, Qt::NoButton, Qt::NoModifier);
+        if (!objects->selectionModel()->selectedRows().isEmpty() ||
+            !view->scene()->selectedItems().isEmpty() || objects->currentRow() != -1) {
+            app.exit(20); return;
+        }
         app.exit(0);
     });
     return app.exec();

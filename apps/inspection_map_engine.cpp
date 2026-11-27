@@ -550,26 +550,6 @@ const MapDrawing *InspectionMapEngine::drawingForFace(const QString &faceId) con
     return found == faceDrawing_.cend() ? nullptr : &drawings_[found.value()];
 }
 
-bool InspectionMapEngine::mapPoint(const QString &drawingId, const QString &faceId,
-                                   const QPointF &point, QVector3D *world) const {
-    const auto *target = drawing(drawingId);
-    if (!target || !target->faceIds.contains(faceId)) return false;
-    for (const auto &triangle : triangles_) {
-        if (triangle.faceId != faceId) continue;
-        const QPointF a = drawingPoint(*target, triangle.a), b = drawingPoint(*target, triangle.b);
-        const QPointF c = drawingPoint(*target, triangle.c);
-        const double denominator = (b.y()-c.y())*(a.x()-c.x()) + (c.x()-b.x())*(a.y()-c.y());
-        if (std::abs(denominator) < 1e-10) continue;
-        const double u = ((b.y()-c.y())*(point.x()-c.x()) + (c.x()-b.x())*(point.y()-c.y())) / denominator;
-        const double v = ((c.y()-a.y())*(point.x()-c.x()) + (a.x()-c.x())*(point.y()-c.y())) / denominator;
-        const double w = 1-u-v;
-        if (u < -0.0001 || v < -0.0001 || w < -0.0001) continue;
-        if (world) *world = triangle.a*float(u) + triangle.b*float(v) + triangle.c*float(w);
-        return true;
-    }
-    return false;
-}
-
 const UnrollSheet *InspectionMapEngine::unrollSheet(const QString &id) const {
     for (const auto &sheet : unrollSheets_) if (sheet.id == id) return &sheet;
     return nullptr;
@@ -596,77 +576,6 @@ bool UnrollSheet::point(const QString &faceId, const QVector3D &world, QPointF *
         }
     }
     return false;
-}
-
-bool UnrollChart::point(const QString &faceId, const QVector3D &world, QPointF *unrolled) const {
-    for (const auto &strip : strips) {
-        if (strip.faceId != faceId) continue;
-        const QVector3D direction = (strip.end - strip.start).normalized();
-        const double distance = QVector3D::dotProduct(world - strip.start, direction);
-        if (distance < -0.05 || distance > strip.width + 0.05) return false;
-        if (unrolled) *unrolled = QPointF(strip.offset + std::clamp(distance, 0.0, strip.width), -world.z());
-        return true;
-    }
-    return false;
-}
-
-UnrollChart InspectionMapEngine::unroll(const QString &partId) const {
-    UnrollChart chart;
-    chart.partId = partId;
-    QHash<QString, QVector<QVector3D>> faces;
-    for (const auto &triangle : triangles_) {
-        if (triangle.partId != partId) continue;
-        auto &vertices = faces[triangle.faceId];
-        vertices.append(triangle.a); vertices.append(triangle.b); vertices.append(triangle.c);
-    }
-    QVector3D center;
-    int centerCount = 0;
-    for (const auto &vertices : faces) for (const auto &v : vertices) { center += v; ++centerCount; }
-    if (centerCount) center /= float(centerCount);
-    for (auto it = faces.cbegin(); it != faces.cend(); ++it) {
-        const auto &vertices = it.value();
-        if (vertices.size() < 3) continue;
-        double mx = 0, my = 0, xx = 0, xy = 0, yy = 0;
-        double bottom = std::numeric_limits<double>::infinity(), top = -bottom;
-        for (const auto &v : vertices) { mx += v.x(); my += v.y(); bottom = std::min(bottom, double(v.z())); top = std::max(top, double(v.z())); }
-        mx /= vertices.size(); my /= vertices.size();
-        for (const auto &v : vertices) { const double x = v.x() - mx, y = v.y() - my; xx += x*x; xy += x*y; yy += y*y; }
-        const double angle = 0.5 * std::atan2(2*xy, xx - yy);
-        QVector3D tangent(float(std::cos(angle)), float(std::sin(angle)), 0);
-        double low = std::numeric_limits<double>::infinity(), high = -low, spread = 0;
-        for (const auto &v : vertices) {
-            const double along = (v.x() - mx)*tangent.x() + (v.y() - my)*tangent.y();
-            const double across = -(v.x() - mx)*tangent.y() + (v.y() - my)*tangent.x();
-            low = std::min(low, along); high = std::max(high, along);
-            spread = std::max(spread, std::abs(across));
-        }
-        const double width = high - low;
-        if (top - bottom < 0.1 || width < 0.1 || spread > std::max(0.05, width * 0.08)) {
-            chart.excludedFaces.append(it.key());
-            continue;
-        }
-        const QVector3D midpoint(float(mx), float(my), 0);
-        const QVector3D radial = midpoint - QVector3D(center.x(), center.y(), 0);
-        if (tangent.x()*radial.y() - tangent.y()*radial.x() < 0) tangent = -tangent;
-        const QVector3D start = midpoint - tangent * float(width / 2);
-        chart.strips.append({it.key(), start, start + tangent * float(width), 0, width,
-                             bottom, top, it.key().contains(QStringLiteral("-IN-"))});
-    }
-    std::sort(chart.strips.begin(), chart.strips.end(), [&center](const auto &a, const auto &b) {
-        if (a.interior != b.interior) return !a.interior;
-        const auto am = (a.start + a.end) / 2 - center, bm = (b.start + b.end) / 2 - center;
-        const double aa = std::atan2(double(am.y()), double(am.x()));
-        const double ba = std::atan2(double(bm.y()), double(bm.x()));
-        return aa == ba ? a.faceId < b.faceId : aa < ba;
-    });
-    for (auto &strip : chart.strips) {
-        double &offset = strip.interior ? chart.interiorWidth : chart.exteriorWidth;
-        strip.offset = offset;
-        offset += strip.width;
-    }
-    for (auto &strip : chart.strips) if (strip.interior) strip.offset += chart.exteriorWidth + 0.5;
-    chart.excludedFaces.sort();
-    return chart;
 }
 
 QPointF InspectionMapEngine::drawingPoint(const MapDrawing &drawing, const QVector3D &point) {

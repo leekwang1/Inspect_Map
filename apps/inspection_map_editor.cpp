@@ -561,7 +561,7 @@ bool writeXlsx(const QString &path, const QVector<const ProjectedDamage *> &dama
         xml += QStringLiteral("</row>");
     }
     xml += QStringLiteral("<row r=\"%1\">").arg(damages.size()+3);
-    textCell(damages.size()+3, 0, QStringLiteral("투영 객체별 초안 · 중복 촬영 손상 미병합"));
+    textCell(damages.size()+3, 0, QStringLiteral("검토된 손상 기준 · 3D 투영 물량"));
     xml += QStringLiteral("</row>");
     xml += QStringLiteral("</sheetData></worksheet>");
     struct Entry { QByteArray name, data; quint32 crc = 0, offset = 0; };
@@ -609,41 +609,6 @@ bool writeXlsx(const QString &path, const QVector<const ProjectedDamage *> &dama
     append16(&archive, quint16(entries.size())); append16(&archive, quint16(entries.size()));
     append32(&archive, quint32(directory.size())); append32(&archive, directoryOffset); append16(&archive, 0);
     return file.write(archive) == archive.size() && file.commit();
-}
-
-void fillUnrollScene(QGraphicsScene *scene, const UnrollChart &chart, const ProjectionBatch &batch,
-                     const QString &selectedObject = {}) {
-    scene->clear();
-    for (const auto &strip : chart.strips) {
-        const QRectF frame(strip.offset, -strip.top, strip.width, strip.top - strip.bottom);
-        scene->addRect(frame, QPen(QColor(76, 99, 110), 0),
-                       QBrush(strip.interior ? QColor(235, 244, 247) : QColor(249, 251, 251)));
-        auto *label = scene->addText(strip.faceId.section(QLatin1Char('-'), -3));
-        label->setDefaultTextColor(QColor(56, 74, 83));
-        label->setScale(0.015);
-        label->setPos(strip.offset + 0.03, -strip.top + 0.03);
-    }
-    for (const auto &item : batch.items) {
-        if (item.partId != chart.partId || item.paths.isEmpty()) continue;
-        const bool selected = item.objectId == selectedObject;
-        QPen pen(selected ? QColor(0, 141, 112) : QColor(196, 52, 49), selected ? 3.5 : 2);
-        pen.setCosmetic(true);
-        for (const auto &line : item.paths) {
-            QPainterPath path;
-            bool valid = true;
-            for (int i = 0; i < line.size(); ++i) {
-                QPointF point;
-                if (!chart.point(item.faceId, line[i], &point)) { valid = false; break; }
-                if (i == 0) path.moveTo(point); else path.lineTo(point);
-            }
-            if (!valid || line.isEmpty()) continue;
-            if (line.size() == 1) path.addEllipse(path.currentPosition(), 0.015, 0.015);
-            auto *drawn = scene->addPath(path, pen);
-            drawn->setZValue(selected ? 2 : 1);
-            drawn->setToolTip(item.imageName + QStringLiteral(" · ") + item.faceId);
-        }
-    }
-    if (!scene->items().isEmpty()) scene->setSceneRect(scene->itemsBoundingRect().adjusted(-0.3, -0.3, 0.3, 0.3));
 }
 
 class MapWindow : public QMainWindow {
@@ -969,7 +934,7 @@ private:
             .arg(item->imageName, typeLabel(item->type), item->reason,
                  item->reviewState.isEmpty() ? QStringLiteral("미검토") :
                  item->reviewState == QStringLiteral("EXCLUDED") ? QStringLiteral("제외") :
-                 item->reviewState == QStringLiteral("DEFERRED") ? QStringLiteral("보류") : QStringLiteral("수동 확정")));
+                 item->reviewState == QStringLiteral("DEFERRED") ? QStringLiteral("보류") : QStringLiteral("알 수 없음")));
         if (!item->groupId.isEmpty()) {
             QStringList images;
             for (const auto &name : item->sourceImageNames)
@@ -1046,7 +1011,7 @@ private:
             QMessageBox::information(this, QStringLiteral("손상 선택"), QStringLiteral("검토할 손상을 먼저 선택하십시오.")); return;
         }
         QString error;
-        if (!InspectionMapWorkflow::review(projectDb_, batch_.runId, reviewObjectId_, engine_, decision, nullptr, &error)) {
+        if (!InspectionMapWorkflow::review(projectDb_, batch_.runId, reviewObjectId_, decision, &error)) {
             QMessageBox::warning(this, QStringLiteral("검토 저장 실패"), error); return;
         }
         loadBatch();
@@ -1291,7 +1256,7 @@ private:
                 sheet->side == QStringLiteral("IN") ? QStringLiteral("내측") : QStringLiteral("무구분");
             drawingTitle_->setText(QStringLiteral("%1 · %2 전개 · %3구간 · 면 %4 · 전개 제외 손상 %5 · %6")
                 .arg(sheet->series, sideName).arg(sheet->parts.size()).arg(sheet->faces.size())
-                .arg(excludedDamage).arg(sheet->sourceDxf ? QStringLiteral("기준 DXF") : QStringLiteral("모델 자동 생성")));
+                .arg(excludedDamage).arg(QStringLiteral("모델 자동 생성")));
             if (fit) fillItems(id);
             fillVerifiedUnrollScene(scene_, *sheet, engine_, batch_, selectedDamageIds());
             if (fit) view_->fit();
@@ -1363,7 +1328,7 @@ private:
             "th,td{border:1px solid #cdd6d9;padding:6px 8px;text-align:left}th{background:#e8eff0}"
             ".note{color:#526b78;font-size:12px}@media(max-width:1100px){.sheet{grid-template-columns:1fr}}"
             "@media print{@page{size:A1 landscape}body{margin:12mm}.sheet{grid-template-columns:minmax(0,1fr) 32%}tr{break-inside:avoid}}"
-            "</style></head><body><h1>%1 외관조사망도</h1><p>투영 객체별 초안 · 중복 촬영 미병합 · 3D 투영 물량</p>")
+            "</style></head><body><h1>%1 외관조사망도</h1><p>검토된 손상 기준 · 3D 투영 물량</p>")
             .arg(part.toHtmlEscaped());
         html += QStringLiteral("<div class=\"sheet\"><img alt=\"부재 망도\" src=\"data:image/png;base64,%1\">")
             .arg(QString::fromLatin1(png.toBase64()));
@@ -1419,7 +1384,7 @@ private:
             painter.drawText(QRectF(40, 95, page.width() - 80, 25),
                 QStringLiteral("측면 전개 · %1구간 · 면 %2 · %3")
                     .arg(sheet->parts.size()).arg(sheet->faces.size())
-                    .arg(sheet->sourceDxf ? QStringLiteral("기준 전개 DXF") : QStringLiteral("모델 자동 생성")));
+                    .arg(QStringLiteral("모델 자동 생성")));
             QGraphicsScene drawingScene;
             fillVerifiedUnrollScene(&drawingScene, *sheet, engine_, batch_);
             if (!drawingScene.items().isEmpty())
