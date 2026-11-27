@@ -5,6 +5,9 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QSqlDatabase>
 #include <QSqlQuery>
 #include <QSqlRecord>
@@ -39,6 +42,66 @@ int main(int argc, char *argv[]) {
         }
         QSqlDatabase::removeDatabase(connection);
     }
+    ProjectionBatch exportBatch;
+    exportBatch.runId = QStringLiteral("run-1");
+    exportBatch.registrationId = QStringLiteral("registration-1");
+    ProjectedDamage included;
+    included.objectId = QStringLiteral("damage-1");
+    included.imageName = QStringLiteral("image-1.jpg");
+    included.type = QStringLiteral("crack");
+    included.partId = QStringLiteral("part-1");
+    included.faceId = QStringLiteral("face-1");
+    included.status = QStringLiteral("PROJECTED");
+    included.paths = {{QVector3D(1, 2, 3), QVector3D(4, 5, 6)}};
+    included.boxWidthMm = 400;
+    included.boxLengthMm = 4000;
+    included.crackP90Mm = 0.3;
+    included.groupId = QStringLiteral("group-1");
+    included.groupKind = QStringLiteral("CONNECTED");
+    included.sourceObjectIds = {QStringLiteral("damage-1"), QStringLiteral("damage-2")};
+    included.sourceImageNames = {QStringLiteral("image-1.jpg"), QStringLiteral("image-2.jpg")};
+    exportBatch.items.append(included);
+    auto omitted = included;
+    omitted.objectId = QStringLiteral("damage-3");
+    omitted.status = QStringLiteral("EXCLUDED");
+    exportBatch.items.append(omitted);
+    omitted.objectId = QStringLiteral("damage-4");
+    omitted.status = QStringLiteral("PROJECTED");
+    omitted.reviewState = QStringLiteral("DEFERRED");
+    exportBatch.items.append(omitted);
+    omitted.objectId = QStringLiteral("damage-5");
+    omitted.status = QStringLiteral("NEEDS_REVIEW");
+    omitted.reviewState.clear();
+    exportBatch.items.append(omitted);
+    const QString exportPath = QDir(temp.path()).filePath(QStringLiteral("model_damage_3d.json"));
+    int exported = 0;
+    QString exportError;
+    if (!InspectionMapWorkflow::exportModelDamageJson(exportBatch, QStringLiteral("inspection-1"),
+            QStringLiteral("dataset-1"), exportPath, &exported, &exportError) || exported != 1) return 40;
+    QFile exportFile(exportPath);
+    if (!exportFile.open(QIODevice::ReadOnly)) return 41;
+    const auto document = QJsonDocument::fromJson(exportFile.readAll()).object();
+    const auto damages = document.value(QStringLiteral("damages")).toArray();
+    const auto damage = damages.isEmpty() ? QJsonObject() : damages.first().toObject();
+    const auto geometry = damage.value(QStringLiteral("geometry")).toObject();
+    const auto coordinates = geometry.value(QStringLiteral("paths_xyz")).toArray();
+    const auto measurements = damage.value(QStringLiteral("measurements")).toObject();
+    const auto provenance = damage.value(QStringLiteral("source")).toObject();
+    const auto omittedCounts = document.value(QStringLiteral("omitted")).toObject();
+    if (document.value(QStringLiteral("schema")).toString() != QStringLiteral("inspectmap.model_damage.v1") ||
+        document.value(QStringLiteral("coordinate_system")).toObject().value(QStringLiteral("unit")).toString() != QStringLiteral("m") ||
+        document.value(QStringLiteral("damage_count")).toInt() != 1 || damages.size() != 1 ||
+        damage.value(QStringLiteral("damage_id")).toString() != included.objectId ||
+        geometry.value(QStringLiteral("type")).toString() != QStringLiteral("MultiPath3D") ||
+        coordinates.size() != 1 || coordinates.first().toArray().size() != 2 ||
+        coordinates.first().toArray().first().toArray().first().toDouble() != 1 ||
+        measurements.value(QStringLiteral("bbox_width_m")).toDouble() != 0.4 ||
+        measurements.value(QStringLiteral("bbox_length_m")).toDouble() != 4.0 ||
+        measurements.value(QStringLiteral("crack_width_p90_mm")).toDouble() != 0.3 ||
+        provenance.value(QStringLiteral("object_ids")).toArray().size() != 2 ||
+        omittedCounts.value(QStringLiteral("excluded")).toInt() != 1 ||
+        omittedCounts.value(QStringLiteral("deferred")).toInt() != 1 ||
+        omittedCounts.value(QStringLiteral("unprojected")).toInt() != 1) return 42;
     const QString dbPath = QDir(temp.path()).filePath(QStringLiteral("project.sqlite"));
     if (!QFile::copy(sourceDb, dbPath)) return 3;
     const QDir calibrationSource(QFileInfo(sourceDb).dir().filePath(QStringLiteral("source/calibration")));

@@ -48,4 +48,7 @@ public:
                       const QString &representativeId, const QString &kind, QString *error);
     static bool ungroup(const QString &projectDb, const QString &runId,
                         const QString &groupId, QString *error);
+    static bool exportModelDamageJson(const ProjectionBatch &batch, const QString &inspectionId,
+                                      const QString &datasetId, const QString &path,
+                                      int *exported, QString *error);
 };

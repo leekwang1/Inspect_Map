@@ -8,6 +8,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QQuaternion>
+#include <QSaveFile>
 #include <QSet>
 #include <QSqlDatabase>
 #include <QSqlError>
@@ -559,6 +560,88 @@ bool InspectionMapWorkflow::active(const QString &projectDb, const QString &insp
             if (hidden.contains(batch->items[i].objectId)) batch->items.removeAt(i);
         return true;
     });
+}
+
+bool InspectionMapWorkflow::exportModelDamageJson(const ProjectionBatch &batch,
+        const QString &inspectionId, const QString &datasetId, const QString &path,
+        int *exported, QString *error) {
+    if (exported) *exported = 0;
+    if (batch.runId.isEmpty() || inspectionId.isEmpty() || datasetId.isEmpty() || path.isEmpty()) {
+        if (error) *error = QStringLiteral("활성 투영 결과와 출력 경로가 필요합니다.");
+        return false;
+    }
+
+    QJsonArray damages;
+    int excluded = 0, deferred = 0, unprojected = 0;
+    for (const auto &item : batch.items) {
+        if (item.status == QStringLiteral("EXCLUDED")) { ++excluded; continue; }
+        if (item.reviewState == QStringLiteral("DEFERRED")) { ++deferred; continue; }
+        if (item.status != QStringLiteral("PROJECTED") || item.paths.isEmpty()) {
+            ++unprojected; continue;
+        }
+        const QStringList sourceIds = item.sourceObjectIds.isEmpty() ?
+            QStringList{item.objectId} : item.sourceObjectIds;
+        const QStringList sourceImages = item.sourceImageNames.isEmpty() ?
+            QStringList{item.imageName} : item.sourceImageNames;
+        QJsonArray sourceObjectIds, sourceImageNames;
+        for (const auto &id : sourceIds) sourceObjectIds.append(id);
+        for (const auto &name : sourceImages) sourceImageNames.append(name);
+        auto measured = [](double millimetres, double scale) -> QJsonValue {
+            return std::isfinite(millimetres) && millimetres > 0 ?
+                QJsonValue(millimetres * scale) : QJsonValue(QJsonValue::Null);
+        };
+        damages.append(QJsonObject{
+            {QStringLiteral("damage_id"), item.objectId},
+            {QStringLiteral("type"), item.type},
+            {QStringLiteral("part_id"), item.partId},
+            {QStringLiteral("face_id"), item.faceId},
+            {QStringLiteral("geometry"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("MultiPath3D")},
+                {QStringLiteral("paths_xyz"), pathsJson(item.paths)}
+            }},
+            {QStringLiteral("measurements"), QJsonObject{
+                {QStringLiteral("bbox_width_m"), measured(item.boxWidthMm, 0.001)},
+                {QStringLiteral("bbox_length_m"), measured(item.boxLengthMm, 0.001)},
+                {QStringLiteral("crack_width_p90_mm"), measured(item.crackP90Mm, 1.0)}
+            }},
+            {QStringLiteral("source"), QJsonObject{
+                {QStringLiteral("group_id"), item.groupId.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(item.groupId)},
+                {QStringLiteral("group_kind"), item.groupKind.isEmpty() ? QJsonValue(QJsonValue::Null) : QJsonValue(item.groupKind)},
+                {QStringLiteral("object_ids"), sourceObjectIds},
+                {QStringLiteral("image_names"), sourceImageNames}
+            }}
+        });
+    }
+    const QJsonObject document{
+        {QStringLiteral("schema"), QStringLiteral("inspectmap.model_damage.v1")},
+        {QStringLiteral("generated_at_utc"), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)},
+        {QStringLiteral("coordinate_system"), QJsonObject{
+            {QStringLiteral("frame"), QStringLiteral("MODEL")},
+            {QStringLiteral("unit"), QStringLiteral("m")},
+            {QStringLiteral("axes"), QJsonArray{QStringLiteral("x"), QStringLiteral("y"), QStringLiteral("z")}}
+        }},
+        {QStringLiteral("source"), QJsonObject{
+            {QStringLiteral("inspection_id"), inspectionId},
+            {QStringLiteral("dataset_id"), datasetId},
+            {QStringLiteral("projection_run_id"), batch.runId},
+            {QStringLiteral("registration_id"), batch.registrationId}
+        }},
+        {QStringLiteral("damage_count"), damages.size()},
+        {QStringLiteral("omitted"), QJsonObject{
+            {QStringLiteral("excluded"), excluded},
+            {QStringLiteral("deferred"), deferred},
+            {QStringLiteral("unprojected"), unprojected}
+        }},
+        {QStringLiteral("damages"), damages}
+    };
+    QSaveFile file(path);
+    const QByteArray payload = QJsonDocument(document).toJson(QJsonDocument::Indented);
+    if (!file.open(QIODevice::WriteOnly) || file.write(payload) != payload.size() || !file.commit()) {
+        if (error) *error = file.errorString();
+        return false;
+    }
+    if (exported) *exported = damages.size();
+    return true;
 }
 
 bool InspectionMapWorkflow::review(const QString &projectDb, const QString &runId,

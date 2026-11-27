@@ -780,15 +780,21 @@ public:
             decisionRow->addWidget(button);
         }
         reviewLayout->addLayout(decisionRow); rightLayout->addWidget(reviewBox);
+        auto *exportBox = new QGroupBox(QStringLiteral("내보내기"));
+        auto *exportLayout = new QVBoxLayout(exportBox);
         auto *exportButton = new QPushButton(QStringLiteral("부재 망도 PDF·물량표"));
         connect(exportButton, &QPushButton::clicked, this, [this] { exportPart(); });
-        rightLayout->addWidget(exportButton);
+        exportLayout->addWidget(exportButton);
         auto *htmlButton = new QPushButton(QStringLiteral("부재 망도 HTML"));
         connect(htmlButton, &QPushButton::clicked, this, [this] { exportPartHtml(); });
-        rightLayout->addWidget(htmlButton);
+        exportLayout->addWidget(htmlButton);
         auto *excelButton = new QPushButton(QStringLiteral("손상 물량 Excel"));
         connect(excelButton, &QPushButton::clicked, this, [this] { exportPartXlsx(); });
-        rightLayout->addWidget(excelButton);
+        exportLayout->addWidget(excelButton);
+        auto *jsonButton = new QPushButton(QStringLiteral("전체 3D 손상 JSON"));
+        connect(jsonButton, &QPushButton::clicked, this, [this] { exportModelDamageJson(); });
+        exportLayout->addWidget(jsonButton);
+        rightLayout->addWidget(exportBox);
         split->addWidget(right);
         split->setStretchFactor(0, 0); split->setStretchFactor(1, 1); split->setStretchFactor(2, 0);
         split->setSizes({230, 760, 650});
@@ -1305,6 +1311,27 @@ private:
         if (path.isEmpty()) return;
         if (!exportXlsxForBatch(part, path)) QMessageBox::warning(this, QStringLiteral("Excel 출력 실패"), path);
         else statusBar()->showMessage(QStringLiteral("Excel 출력: ") + path, 6000);
+    }
+
+    void exportModelDamageJson() {
+        if (batch_.runId.isEmpty() || dataset_->currentData().toString().isEmpty()) {
+            QMessageBox::information(this, QStringLiteral("투영 결과 없음"),
+                QStringLiteral("데이터 세트를 선택하고 손상 3D 투영을 먼저 실행하십시오."));
+            return;
+        }
+        const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("모델 좌표계 3D 손상 JSON"),
+            QDir(QFileInfo(projectDb_).absolutePath()).filePath(QStringLiteral("model_damage_3d.json")),
+            QStringLiteral("JSON (*.json)"));
+        if (path.isEmpty()) return;
+        QString error;
+        int count = 0;
+        if (!InspectionMapWorkflow::exportModelDamageJson(batch_, inspectionId_,
+                dataset_->currentData().toString(), path, &count, &error)) {
+            QMessageBox::warning(this, QStringLiteral("JSON 출력 실패"), error);
+            return;
+        }
+        QMessageBox::information(this, QStringLiteral("JSON 출력 완료"),
+            QStringLiteral("모델 좌표계 손상 %1건을 저장했습니다.\n%2").arg(count).arg(path));
     }
 
     bool writePartHtml(const QString &part, const QString &path) {

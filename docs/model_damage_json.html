@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>InspectMap 3D 손상 JSON 형식</title>
+  <style>
+    :root { color-scheme: light; font-family: "Malgun Gothic", "Segoe UI", sans-serif; }
+    body { margin: 0; color: #183043; background: #f4f7f8; line-height: 1.6; }
+    header { background: #243b4e; color: white; padding: 22px 32px; }
+    h1 { margin: 0; font-size: 22px; }
+    main { max-width: 920px; margin: 0 auto; padding: 24px 32px 48px; }
+    h2 { margin: 28px 0 10px; font-size: 17px; }
+    p { margin: 8px 0; }
+    table { width: 100%; border-collapse: collapse; background: white; }
+    th, td { padding: 9px 12px; border: 1px solid #cad7dc; text-align: left; vertical-align: top; }
+    th { background: #e5edef; }
+    code, pre { font-family: Consolas, monospace; }
+    code { overflow-wrap: anywhere; }
+    pre { padding: 16px; overflow-x: auto; background: #192a36; color: #edf5f7; }
+    .note { border-left: 3px solid #147c70; padding-left: 12px; }
+  </style>
+</head>
+<body>
+  <header><h1>InspectMap · 모델 좌표계 3D 손상 JSON</h1></header>
+  <main>
+    <p>외관망도 작성기의 <strong>전체 3D 손상 JSON</strong> 버튼은 현재 데이터 세트의 활성 투영 결과를 한 파일로 저장합니다. 형식 식별자는 <code>inspectmap.model_damage.v1</code>입니다.</p>
+
+    <h2>포함 기준</h2>
+    <p>모델 표면에 투영이 완료되고 3D 경로가 있는 손상만 <code>damages</code>에 들어갑니다. 투영 검토에서 제외하거나 보류한 손상, 투영이 불완전한 손상은 생략하고 건수를 <code>omitted</code>에 기록합니다. 동일 손상 묶음은 대표 1건, 이어진 손상은 원래 선들을 유지한 대표 1건으로 나옵니다.</p>
+
+    <h2>주요 필드</h2>
+    <table>
+      <thead><tr><th>필드</th><th>의미</th></tr></thead>
+      <tbody>
+        <tr><td><code>coordinate_system</code></td><td>좌표계 <code>MODEL</code>, 축 순서 <code>x,y,z</code>, 좌표 단위 <code>m</code>. 지리 좌표계나 GeoJSON 좌표가 아닙니다.</td></tr>
+        <tr><td><code>source</code></td><td>점검, 데이터 세트, 투영 실행 및 정합 결과 ID. 어느 결과에서 생성됐는지 추적할 때 사용합니다.</td></tr>
+        <tr><td><code>damage_count</code>, <code>omitted</code></td><td>출력된 손상 수와 제외·보류·투영 미완료 건수.</td></tr>
+        <tr><td><code>damages[].geometry.paths_xyz</code></td><td>각 경로는 <code>[[x,y,z], ...]</code> 형식입니다. 여러 선이나 경계 경로를 담을 수 있으며, 서로 떨어진 경로 사이가 연결됐다는 뜻은 아닙니다.</td></tr>
+        <tr><td><code>damages[].measurements</code></td><td>3D 투영 외접 폭·길이는 m, 균열 두께 p90은 mm입니다. 계산할 수 없는 값은 <code>null</code>입니다.</td></tr>
+        <tr><td><code>damages[].source</code></td><td>대표 손상에 연결된 원본 객체 ID와 영상 이름. 묶음이 없으면 원본 1건이 들어갑니다.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>예시</h2>
+    <pre><code>{
+  "schema": "inspectmap.model_damage.v1",
+  "generated_at_utc": "2026-11-27T09:00:00.000Z",
+  "coordinate_system": {"frame": "MODEL", "unit": "m", "axes": ["x", "y", "z"]},
+  "source": {
+    "inspection_id": "inspection-1",
+    "dataset_id": "dataset-1",
+    "projection_run_id": "run-1",
+    "registration_id": "registration-1"
+  },
+  "damage_count": 1,
+  "omitted": {"excluded": 0, "deferred": 0, "unprojected": 0},
+  "damages": [{
+    "damage_id": "damage-1",
+    "type": "crack",
+    "part_id": "part-1",
+    "face_id": "face-1",
+    "geometry": {"type": "MultiPath3D", "paths_xyz": [[[1.0, 2.0, 3.0], [1.2, 2.1, 3.0]]]},
+    "measurements": {"bbox_width_m": 0.4, "bbox_length_m": 4.0, "crack_width_p90_mm": 0.3},
+    "source": {"group_id": null, "group_kind": null,
+               "object_ids": ["damage-1"], "image_names": ["image-1.jpg"]}
+  }]
+}</code></pre>
+    <p class="note"><code>MultiPath3D</code>는 InspectMap 전용 경로 표현입니다. 면형 손상의 경계를 포함할 수 있지만 GeoJSON Polygon의 링·면 위상 규칙을 보장하지 않습니다. 균열 두께 p90은 영상 탐지의 추정값이며 현장 실측값이 아닙니다.</p>
+  </main>
+</body>
+</html>
